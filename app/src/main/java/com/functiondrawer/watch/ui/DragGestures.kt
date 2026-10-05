@@ -306,25 +306,54 @@ internal suspend fun AwaitPointerEventScope.awaitOneWayDrag(
  * 5. 抬手：位移够 1/3 行宽 → 先播 [DELETE_OUT_MS] 的"甩出去"，播完（**或者动画被打断**）
  *    再调 `onDelete()` —— `finally` 里交删除，保证"滑了却没删掉"不会发生；
  *    不够 → `dragX` 归零（行弹回原位）。
+ * 6. **甩出阶段的起点就是松手位置**（本轮修的第二个动画 bug）：抬手之后
+ *    `awaitEachGesture` 会立刻把循环体再跑一遍，所以"新一串手势要归零"这句话
+ *    必须加上"**除非上一串已经进入甩出**"这个前提 —— 否则甩出动画的第一帧
+ *    是从行原来的位置（用户眼里的"中间"）开始的。状态与判定在
+ *    [SwipeDeleteMotion]（纯 Kotlin、离线单测钉着），本类只做镜像与接线。
  *
  * ## 撤销
  *
- * 撤销条不在这一层：删除动作仍然走调用方原来那条回调（对象行是
- * `GraphState.removeObject`，它会把被删的那一个存进 `lastDeletedObject`；
- * 滑动条行是 `GraphState.removeSlider`，存进 `lastDeletedSlider`），
- * 于是底部浮出 2 秒的「已删除 · 点此撤销」。三行在这一点上也**走同一条路**：
- * 删除 = 一次状态层调用，撤销 = 状态层自己那一份备份，谁也不在这里自己记一份。
- * ⚠️ 每路备份都必须在 `GraphScreen` 那个 2 秒到期的 effect 里被 `forget*` 掉 ——
- * 漏一路的后果不是"消失得慢"，而是"撤销条永不消失、还会把两笔删除混在一起"
- * （几何对象那一路真机踩过，见 `GraphScreen` 里那段注释）。
+ * 撤销不在这一层：删除动作仍然走调用方原来那条回调（对象行是
+ * `GraphState.removeObject`，滑动条行是 `GraphState.removeSlider`），
+ * 而**撤销只有一条路** —— `GraphState` 在改动之前 `pushUndo(...)` 压一份快照，
+ * 用户从工具条上那对箭头（← 撤销 / → 重做，见 `Common.rememberToolbarUndoMenu`）撤回来。
+ *
+ * ⚠️ 本轮变化：原来这里还有一套"删除后底部浮出 2 秒的「已删除 · 点此撤销」"
+ * （`lastDeleted` / `lastDeletedObject` / `lastDeletedSlider` 那几路备份），
+ * 用户要求"把所有的撤销的 toast 提示都给删掉"，那一套**连同状态一起删了** ——
+ * 现在删除只做两件事：状态层记一步撤销点 + 弹一条**纯提示**的 toast（不可点）。
+ * 三行（函数 / 几何对象 / 滑动条）在这一点上仍然**走同一条路**：
+ * 删除 = 一次状态层调用，历史 = 状态层那一份快照栈，谁也不在这里自己记一份。
  */
 internal class RowSwipeDelete(
     private val scope: CoroutineScope,
     private val onDelete: () -> Unit
 ) {
-    /** 跟手位移（px，往左为负）。行画在哪全靠它。 */
+    /**
+     * 跟手位移、以及"这一行是不是已经进入甩出阶段"，**全部**由这个纯 Kotlin 状态机决定
+     * （[SwipeDeleteMotion]，离线单测钉着）。真因写在它的类注释里，一句话概括：
+     * **抬手之后 `awaitEachGesture` 会立刻把循环体再跑一遍**，而循环体第一句原来是
+     * `dragX = 0f` —— 于是甩出动画不是从松手位置开始，而是从"行原来的位置"开始，
+     * 用户看到的就是"先弹回中间、再往左滑"。
+     */
+    private val motion = SwipeDeleteMotion()
+
+    /**
+     * 跟手位移（px，往左为负）的 **Compose 镜像** —— 行画在哪全靠它。
+     *
+     * 为什么要有这一份镜像、而不是让渲染层直接读 `motion.followPx`：渲染层是在
+     * `graphicsLayer { }`（甩出的位移）和组合期（危险色渐染）读它的，只有**快照状态**
+     * 的读才会让那一帧失效；而纯 Kotlin 那一份不能依赖 Compose 运行时（离线单测要编它）。
+     * 镜像只在 [syncFollow] 一处更新，所以"两个数不一致"这件事不可能发生。
+     */
     var dragX by mutableStateOf(0f)
         private set
+
+    /** 把纯状态机里的位移同步到 Compose 状态（值没变时是空写入，不会多一次重组）。 */
+    private fun syncFollow() {
+        if (dragX != motion.followPx) dragX = motion.followPx
+    }
 
     /**
      * 「被扔掉」那一下的进度 0..1：横向甩出、缩小、淡出都跟着它。
@@ -361,9 +390,13 @@ internal class RowSwipeDelete(
      * `graphicsLayer` 里原来各写了一遍 `dragX - sweepShiftPx(...)`，
      * 于是同一个符号错误被抄了三份。合成之后"往左甩出"这件事只有一处实现，
      * 三行结构性地一致。
+     *
+     * ⚠️ **起点**（本轮修的第二个动画 bug）：这里的 [dragX] 在甩出阶段**不会被清零**
+     * （见 [SwipeDeleteMotion] 的类注释），所以 `sweep = 0` 这一帧算出来的就是
+     * **松手位置**本身 —— "从松手的位置继续往左甩"在算式上就是这一句。
      */
     fun translationXPx(rowWidthPx: Float): Float =
-        swipeDeleteTranslationPx(dragX, rowWidthPx, sweep)
+        motion.translationPx(rowWidthPx, sweep)
 
     /** 「被扔掉」那一下的缩放系数。 */
     fun sweepScale(): Float = swipeDeleteSweepScale(sweep)
@@ -401,8 +434,19 @@ internal class RowSwipeDelete(
     ): Modifier =
         Modifier.pointerInput(rowKey, rowWidthPx, skipIfDownConsumed) {
             awaitEachGesture {
-                // 新的一串手势：位移归零（上一次不够远时已经归零过，这里兜底）
-                dragX = 0f
+                // ---- 新的一串手势：位移归零（**但甩出期间绝不归零**）----
+                //
+                // 这一句原来是无条件的 `dragX = 0f`，而 `awaitEachGesture` 的循环体是
+                // `while (isActive) { block(); awaitAllPointersUp() }`（1.7 的字节码，
+                // 见 `SwipeDeleteMotion` 的类注释）—— 抬手那一帧里 `onEnd` 刚把甩出动画
+                // `scope.launch` 出去（只是排队），紧接着循环体就被**再跑一遍**，
+                // 于是这句归零发生在动画的第一帧之前：行先回到原位、再从那里往左甩。
+                // 这就是用户报的"删除之后还会从中间再往左滑动"。
+                //
+                // 交给 `motion.beginGesture()` 之后，"这一串是不是已经进入甩出阶段"
+                // 由状态机自己回答，本文件不再需要知道什么时候该清、什么时候不该清。
+                motion.beginGesture()
+                syncFollow()
                 awaitOneWayDrag(
                     axis = DragAxis.HORIZONTAL,
                     positive = false,          // 只认**往左**
@@ -448,11 +492,14 @@ internal class RowSwipeDelete(
                     abandonIfCrossAxisWins = true,
                     onDrag = { total ->
                         // 只跟手往左的部分（往右不跟手，行不会被拽出屏幕）
-                        dragX = swipeDeleteFollow(total)
+                        motion.drag(total)
+                        syncFollow()
                     },
                     onEnd = { total ->
-                        // 滑够 1/3 行宽才删（这个手势没有二次确认，随手一划不该删掉）
-                        if (swipeDeleteReached(total, rowWidthPx)) {
+                        // 滑够 1/3 行宽才删（这个手势没有二次确认，随手一划不该删掉）。
+                        // 判定与"要不要开始甩出"都在状态机里（`release`），这里只负责
+                        // 按它的结论去播动画、或者把行弹回原位。
+                        if (motion.release(total, rowWidthPx)) {
                             // **先播完"被扔掉"再删**：`onDelete()` 一调这一行就被状态层
                             // 摘掉了，那时再想播动画就没对象了。`dragX` 故意不清零：
                             // 行停在滑到的位置上继续往外甩。
@@ -472,7 +519,8 @@ internal class RowSwipeDelete(
                                 }
                             }
                         } else {
-                            dragX = 0f
+                            // 不够远：行弹回原位（归零发生在 `release` 里，这里只同步镜像）
+                            syncFollow()
                         }
                     }
                 )
@@ -497,5 +545,107 @@ internal fun rememberRowSwipeDelete(
     val scope = rememberCoroutineScope()
     val latest by rememberUpdatedState(onDelete)
     return remember(rowKey) { RowSwipeDelete(scope) { latest() } }
+}
+
+/**
+ * 「工具条上：手指**从一颗键滑到另一颗键**」的横滑原语（本轮新增）。
+ *
+ * 用在两屏的工具条那一条上：第一屏 ⚙ ⇄ `+`、第二屏 📁 ⇄ 🗑，达成之后唤出/收起
+ * 撤销·重做菜单（`Common.rememberToolbarUndoMenu`）。
+ *
+ * ## 为什么不复用 [awaitOneWayDrag]（这是用户那条补充要求逼出来的）
+ *
+ * 用户原话："**按出撤销菜单的条件是从顶部的一个按钮滑到另一个按钮，请不要给顶部的按钮
+ * 还没有滑到另一个按钮的时候就加动画。**" —— 并且明确要求"没跨到另一颗键"时，
+ * ⚙/`+`/📁/🗑 的**短按与长按必须照旧工作**（尤其"从 ⚙ 上按住不动 0.9 秒"仍要进应用信息页）。
+ *
+ * [awaitOneWayDrag] 的契约是"越过触摸容差就**认领**这一串，之后每帧 `consume()`"，
+ * 而"被消费过"会让子节点（按钮自己的 `clickable`）在**同一帧的 Final 阶段**
+ * （= 祖先先收的那个阶段）看到 `isConsumed` → `waitForUpOrCancellation` 返回 null
+ * → **这一次点击被取消**。换成大白话：用 [awaitOneWayDrag] 的话，
+ * **只要在 ⚙ 上横向拖过触摸容差（≈24px）短按就没了** —— 而"拖了十几像素、又没滑到 `+`"
+ * 在用户看来就是"我点了一下设置，没反应"。
+ *
+ * 所以这个原语与它**相反**：**在真的滑到另一颗键之前，一个字节都不消费。**
+ * 按钮的短按、长按、线圈（`HoldToConfirm` 完全不看移动事件）在这期间全都照旧。
+ *
+ * ## 语义（四句话）
+ *
+ *   1. `awaitFirstDown(requireUnconsumed = false)`：落在按钮上照样起手 ——
+ *      按钮自己的 `clickable` 会消费 down，但这不该挡住我们"看着他滑"；
+ *   2. 起手点**不在任何一颗键上**（落在两道键中间那道空当）→ 立刻返回、**零消费**
+ *      （那一段空当是留给"顶部下滑回图像界面"的，见 `FunctionsScreen`）；
+ *   3. 之后每一帧只做两件事：把这一帧的横向位移并进"我们自己的累计"
+ *      （`positionChangeIgnoreConsumed()`，和 [awaitOneWayDrag] **同一把尺子** ——
+ *      别人消费了这一帧也不影响我们算"手指现在在哪"），再拿手指的**绝对 x**
+ *      问一句 [toolbarMenuCrossedToOtherKey]；第一次为真 → `onCross()`；
+ *   4. 从达成的那一帧起**每帧 `consume()`**：这一次手势归工具条 ——
+ *      按钮的点击随之取消（`waitForUpOrCancellation` 在 Final 阶段看到"被消费"就放弃），
+ *      所以"滑到另一颗键、停在那里抬手"**不会**顺带触发那颗键自己的点击
+ *      （滑到 `+` 上松手不会开编辑器、滑到 🗑 上松手不会清屏）。
+ *
+ * ## 达成之后**不会**再切回去（"滑过去又滑回来"的行为）
+ *
+ * 内部有一个闩（`fired`）：**一次手势最多达成一次**。所以
+ * "从 ⚙ 滑到 `+` 上方（菜单展开）→ 手指又退回 ⚙ 上方 → 松手"的最终结果是
+ * **菜单保持展开**，不会跟着手指来回翻。理由有两条：
+ *   * 用户嫌的就是"抽搐"（"还没滑到就开始动"）；跟着手指在边界上来回切，就是另一种抽搐；
+ *   * 一次手势对应一次"决定"，回退要靠**下一次**手势（再滑一下就是收起）——
+ *     和项目里"左滑删除够 1/3 就认了、回搓不再改主意"是同一套取舍。
+ *
+ * ## 零动画是怎么保证的（用户那条要求的落点）
+ *
+ * 这个原语**不向调用方报告任何进度**：没有 `onDrag(total)` 那样的回调，
+ * 只有一次 `onCross()`。调用方在 `onCross` 之前**没有任何"按比例展开"的量可画**——
+ * 菜单的展开/让位/抓手淡出全部只由 `openState`（一个 Bool）驱动。
+ * 于是"还没滑到另一颗键"这一路上，顶部的键**一帧动画都没有**：
+ * 不淡入、不半开、不预先位移、不缩放。这一条是**结构性**的（不是靠某个阈值调出来的）。
+ *
+ * @param keyWidthPx 单颗图标键的宽度（px）—— 就是 `WatchMetrics.iconButton.toPx()`，
+ *   也就是那两颗键**真实的**绘制宽度（形状锁定，见 README）。行宽取的是这个节点
+ *   **自己量到的** `size.width`，所以"两颗键在哪"永远等于真实版面，不需要调用方传几何。
+ * @param onCross 达成的那一刻回调一次（一次手势最多一次）。
+ */
+internal suspend fun AwaitPointerEventScope.awaitKeyToKeySwipe(
+    keyWidthPx: Float,
+    onCross: () -> Unit
+) {
+    val down = awaitFirstDown(requireUnconsumed = false)
+    // 行宽 = **本节点自己量到的宽度**（工具条那一条的 Box），不是谁传进来的估算值：
+    // 两颗键由 `Arrangement.SpaceBetween` 顶到它的两端，于是"键在哪"只依赖这两个数。
+    val rowWidthPx = size.width.toFloat()
+    val startedAt = toolbarKeyAt(down.position.x, rowWidthPx, keyWidthPx)
+    // 起手在两道键中间那道空当（或者版面退化）：这一串与我们无关，**零消费**返回。
+    if (startedAt == ToolbarKeySide.NONE) return
+
+    var total = 0f
+    var fired = false
+    while (true) {
+        val event = awaitPointerEvent()
+        val change = event.changes.firstOrNull { it.id == down.id } ?: break
+        val isUp = change.changedToUpIgnoreConsumed()
+
+        // 这一帧的横向位移（抬手那一帧也算上：有些设备会把最后一段位移并进 up 事件）。
+        // ⚠️ `positionChangeIgnoreConsumed()` 而不是 `positionChange()`：后者在
+        // "这一帧已被别人消费"时返回 0，而"手指现在在哪"这件事**不该**受别人是否消费影响
+        // （第二屏右边缘那条边缘手势就会每帧消费这一串，见 `FunctionsScreen`）。
+        total = oneWayDragStep(total, change.positionChangeIgnoreConsumed().x)
+
+        if (!fired && toolbarMenuCrossedToOtherKey(
+                startedAt = startedAt,
+                nowXPx = down.position.x + total,
+                rowWidthPx = rowWidthPx,
+                keyWidthPx = keyWidthPx
+            )
+        ) {
+            fired = true
+            onCross()
+        }
+        // 达成之后才消费：这一次手势归工具条（按钮的点击随之取消）。
+        // 达成之前一个字节都不消费 —— 短按 / 长按 / 线圈全部照旧。
+        if (fired) change.consume()
+
+        if (isUp) break
+    }
 }
 

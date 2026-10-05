@@ -1,12 +1,15 @@
-﻿# verify-apk.ps1 —— 离线校验 debug APK 的关键元数据（不需要设备，也不需要 Gradle）
+﻿# verify-apk.ps1 —— 离线校验 APK 的关键元数据（不需要设备，也不需要 Gradle）
 #
 # 用途：
-#   构建完之后、装机之前跑一遍，确认产物真的是给「跑完整 Android 11 的圆屏手表」用的，
-#   而不是被误配成了 Wear OS 或者别的包名/最低版本。
+#   构建完之后、装机之前跑一遍，确认产物真的是给「圆屏 Android 手表」用的，
+#   而不是被误配成了 Wear OS 或者别的包名 / 最低版本。
 #
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File tools\verify-apk.ps1
 #   powershell -ExecutionPolicy Bypass -File tools\verify-apk.ps1 -ApkPath D:\some\other.apk
+#
+# 不带 -ApkPath 时默认校验 **release** 产物（app\build\outputs\apk\release\app-release.apk）；
+# 没构建过 release 才退回 debug 产物。
 #
 # 退出码：
 #   0 = 全部检查通过
@@ -39,13 +42,17 @@ $Zipalign       = Join-Path $BuildTools 'zipalign.exe'
 $JdkHome        = 'D:\jdk17'
 
 $ExpectedPackage  = 'com.functiondrawer.watch'
-$ExpectedMinSdk   = '30'      # Android 11
+$ExpectedMinSdk   = '24'      # Android 7.0（用户要求老表 / 老手机也能装）
 $ExpectedTargetSdk = '34'
 $ExpectedLabel    = 'DrawFunc'
 $ExpectedActivity = 'com.functiondrawer.watch.MainActivity'
 $ForbiddenFeature = 'android.hardware.type.watch'   # Wear OS 专用，本项目刻意不声明
 
-$DefaultApk = Join-Path $projectRoot 'app\build\outputs\apk\debug\app-debug.apk'
+$DefaultApk = Join-Path $projectRoot 'app\build\outputs\apk\release\app-release.apk'
+if (-not (Test-Path -LiteralPath $DefaultApk -PathType Leaf)) {
+    # 没构建过 release（比如没配 keystore.properties）时退回 debug 产物
+    $DefaultApk = Join-Path $projectRoot 'app\build\outputs\apk\debug\app-debug.apk'
+}
 if (-not $ApkPath) { $ApkPath = $DefaultApk }
 $ApkPath = [System.IO.Path]::GetFullPath($ApkPath)
 
@@ -193,7 +200,7 @@ Add-Check 'package 名' $ExpectedPackage $(if ($pkg) { $pkg } else { '(缺失)' 
 
 # ---- 2) minSdk
 $minSdk = Get-FirstMatch $badgingLines "sdkVersion:'([^']+)'"
-Add-Check 'minSdkVersion' ("sdkVersion:'" + $ExpectedMinSdk + "'") $(if ($minSdk) { "sdkVersion:'$minSdk'" } else { '(缺失)' }) ($minSdk -eq $ExpectedMinSdk) 'sdkVersion = 30 即 Android 11：圆屏手表跑完整 Android 11，不是 Wear OS'
+Add-Check 'minSdkVersion' ("minSdkVersion:'" + $ExpectedMinSdk + "'") $(if ($minSdk) { "minSdkVersion:'$minSdk'" } else { '(缺失)' }) ($minSdk -eq $ExpectedMinSdk) 'minSdk = 24 即 Android 7.0：圆屏手表跑的是完整 Android（不是 Wear OS），往下兼容到 7.0'
 
 # ---- 3) targetSdk
 $tgtSdk = Get-FirstMatch $badgingLines "targetSdkVersion:'([^']+)'"
@@ -293,6 +300,34 @@ if (Test-Path -LiteralPath $Apksigner -PathType Leaf) {
         $signOk = $false
         Write-Output ''
         Write-Output ("  结论 : FAIL —— apksigner 校验失败（退出码 " + $signExit + '），APK 可能未签名或被改坏')
+    }
+
+    # ---- 签名**档位**（v1 / v2 / v3）单独看一遍 ----
+    #
+    # ⚠️ 为什么要显式加 `--min-sdk-version 21`：`apksigner verify` **默认只检"本包
+    #    minSdkVersion 需要的那几档"**。本包 minSdk = 24（Android 7 已支持 v2），
+    #    所以**默认那条命令即使 APK 里有完好的 v1（JAR）签名，也会打印
+    #    `Verified using v1 scheme (JAR signing): false`** —— 当初"以为 v1 没签上"
+    #    的误会就是这么来的（AGP 的 `enableV1Signing = true` 在 8.5.2 上确实被忽略，
+    #    但"看默认 verify 输出"并不是判断 v1 在不在的正确方法）。
+    #    显式给 21 之后，v1 那行才是真的"在不在"。
+    Write-Output ''
+    Write-Output '  ---- 签名档位（显式按 min-sdk 21 检，才看得见 v1）----'
+    $schemeOut = & $Apksigner 'verify' '--verbose' '--min-sdk-version' '21' $ApkPath 2>&1
+    $v1 = $null; $v2 = $null; $v3 = $null
+    foreach ($ln in $schemeOut) {
+        $s = [string]$ln
+        if ($s -match 'Verified using v1 scheme \(JAR signing\):\s*(true|false)') { $v1 = ($Matches[1] -eq 'true') }
+        if ($s -match 'Verified using v2 scheme \(APK Signature Scheme v2\):\s*(true|false)') { $v2 = ($Matches[1] -eq 'true') }
+        if ($s -match 'Verified using v3 scheme \(APK Signature Scheme v3\):\s*(true|false)') { $v3 = ($Matches[1] -eq 'true') }
+    }
+    Write-Output ('  v1（JAR 签名，老设备用）: ' + $(if ($v1) { 'true' } else { 'false' }))
+    Write-Output ('  v2（Android 7+）        : ' + $(if ($v2) { 'true' } else { 'false' }))
+    Write-Output ('  v3（Android 9+）        : ' + $(if ($v3) { 'true' } else { 'false' }))
+    if (-not $v1) {
+        Write-Output '  INFO : 缺 v1 —— 只认 JAR 签名的老设备（Android 6/7 那批安装器）会装不上。'
+        Write-Output '         release 包补三签： powershell -ExecutionPolicy Bypass -File tools\sign-release.ps1'
+        Write-Output '         （v1 不是本脚本的判定项：debug 包本来就只有 v2，侧载够用）'
     }
 } else {
     Write-Output ("  [跳过] 找不到 apksigner.bat： " + $Apksigner)

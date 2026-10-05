@@ -13,20 +13,30 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.MaterialTheme
+import androidx.compose.material.Surface
 import androidx.compose.material.Text
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -37,65 +47,100 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.TextUnit
+import androidx.compose.ui.unit.dp
+import com.functiondrawer.watch.ui.theme.PillShape
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emptyFlow
+import kotlin.math.round
 import kotlin.math.roundToInt
 
 // ---------------------------------------------------------------------------
-// 「应用信息」页（本轮新增）—— 第一屏那颗 ⚙ 的**长按**进来的一屏。
+// 「应用信息」页 —— 第一屏那颗 ⚙ 的**长按**进来的一屏。
 //
-// 用户原话（逐条都落在这个文件里）：
+// 用户原话（第一轮，逐条都落在这个文件里）：
 //
 // > "长按之后打开应用信息页面（不要有标题），最上方是应用图标，然后下一排是应用名字
 // > （把应用名字改成 DrawFunc），再下一排是应用版本号，再下一排是 Version Code，
 // > 然后再空一排，再下一排写"本应用使用 dsh 开发"，再下一排写"开发者 春羽"。
 // > 注意动画和打开文件列表一样，注意放置返回键。"
 //
-// ## 版面：**没有标题栏**，自上而下就是用户念的那七行
+// 第二轮（本轮）：
+//
+// > "把应用信息界面改成列表，在应用列表底部加一行字：bug反馈：drawfunc@163.com"
+//
+// ## 版面：**没有标题**，内容是一列可滚动的行
+//
+// 上一版是"每一行各自一个绝对落点"（`ICON_TOP` / `NAME_TOP` / `VERSION_TOP` /
+// `CODE_TOP` / `DSH_TOP` / `DEV_TOP`，每个都是"真实屏高的百分之几"）。
+// 用户这一轮要求**改成列表** —— 落点由"一串固定常量"变成"一个 [LazyColumn] 的顺序"，
+// 于是三件事一起变好：
+//   * **加一行不用再重排后面所有行**（底部那行 `bug反馈` 就是这么加的：
+//     往 [`aboutItems`] 末尾追加一项就行，一个落点常量都不用改）；
+//   * **装不下可以滚**：八行加起来 ≈ 241dp，而这一屏从列表上沿到屏幕底只剩 ≈150dp
+//     （233dp 圆表），绝对落点那一版最后几行会被挤到屏幕外；
+//   * 行高、行距、弧宽收窄**全部照抄设置页**（同一套 `ROW_H` / `ROW_GAP` /
+//     `rowWidthFraction`），所以"设置页"和"应用信息页"在手表上看起来是同一种东西。
 //
 // ```
-//   ┌ ● 返回键（左上角，和其它屏同一处，形状锁在 Common.kt）        ← TOOLBAR_TOP / TOOLBAR_H
+//   ┌ ● 返回键（左上角，和其它屏同一处，形状锁在 Common.kt）   ← TOOLBAR_TOP(0.10) / TOOLBAR_H(0.125)
 //   │
-//   │            [ 应用图标 ]                                    ← ICON_TOP / ICON_SIZE
-//   │            DrawFunc                                        ← NAME_TOP（fontTitle、纯白）
-//   │            版本 1.0                                         ← VER_TOP （fontSmall、80% 白）
-//   │            Version Code 1                                   ← +LINE_H
-//   │            （空一排）                                       ← 再 +LINE_H（不画任何东西）
-//   │            本应用使用 dsh 开发                                ← +LINE_H
-//   └            开发者 春羽                                       ← +LINE_H
+//   │   ┌──────────────────────────────┐
+//   │   │          [ 应用图标 ]         │   ← 图标那一行（高 = 0.16 × 短边，只有图标、没有胶囊底）
+//   │   ├──────────────────────────────┤
+//   │   │          DrawFunc            │   ← fontTitle、纯白
+//   │   ├──────────────────────────────┤
+//   │   │         版本 1.1              │   ← fontSmall、80% 白
+//   │   ├──────────────────────────────┤
+//   │   │       Version Code 3         │
+//   │   ├──────────────────────────────┤
+//   │   │        （空一排，无胶囊）      │   ← 用户第一轮要的"再空一排"
+//   │   ├──────────────────────────────┤
+//   │   │      本应用使用 dsh 开发       │
+//   │   ├──────────────────────────────┤
+//   │   │         开发者 春羽           │   ← 纯白收尾
+//   │   ├──────────────────────────────┤
+//   └   │  bug反馈：drawfunc@163.com    │   ← 本轮新增，**列表最后一行**
+//       └──────────────────────────────┘
 // ```
 //
-// **"不要有标题"是照做的**：这一屏没有 "关于" / "应用信息" 之类的标题栏，
+// ⚠️ 最后那一行在 233dp 圆表上**一行装不下**（≈134dp 的字，最窄的行只有 121dp），
+// 所以它**自己会长高**折成两行（用户原话："如果显示全就不管，显示不全就自动换行"）：
+// ```
+//       ┌──────────────────────────────┐
+//       │          bug反馈：            │
+//       │      drawfunc@163.com        │
+//       └──────────────────────────────┘
+// ```
+// 别的行仍然钉死一行高（它们的文案都是一眼读完的短句，换行只会打乱节奏）。
+//
+// **"不要有标题"照旧**：这一屏没有"关于"/"应用信息"之类的标题栏，
 // 顶部只有那一颗返回键（用户原话里"注意放置返回键"指的就是它）。
 //
-// ## 位置 / 宽度分别跟谁走（README 那条长期规则的原文口径）
+// ## 宽度 / 高度分别跟谁走（README 那条长期规则的原文口径）
 //
-//   * **位置**（每一行的 y）→ `geometry.sy(占**真实屏高**的比例)`。
-//     圆表上 `screenH == sizeDp`，所以这些数就是"233dp 的百分之几"；
-//     手机上 `screenH` 是 850dp 那一整块，整块内容因此均匀铺满全屏，
-//     不会像"按短边算"那样挤在顶部一个方格里。
-//   * **宽度**（可点控件的行 / 每一行文字的排版宽度）→
-//     `bandWidth(...)` / `geometry.rowWidth(...)` —— 圆屏取该段上下沿里更窄的弧宽 × 0.93，
-//     非圆屏给"屏宽 − 左右各 3%"。**一个 dp 宽度都没有写死。**
-//   * **控件尺寸**（图标大小、字号）→ `metrics.sizeDp`（短边）比例，和别的屏一致。
+//   * **行宽** → 圆屏走 `rowWidthFraction`（按这一行**此刻**在屏幕上的高度取弧宽 ×
+//     [ARC_MARGIN]，夹在 [MIN_ROW_WIDTH] ~ [SQUARE_ROW_WIDTH] 之间），
+//     非圆屏走 `geometry.rowWidth(...)`（屏宽 − 左右各 3%）。**一个 dp 宽度都没写死。**
+//     ⚠️ 行宽必须按"这一行现在在屏幕上的高度"算，不能按序号算 —— 列表能滚之后
+//     两者不是一回事（设置页踩过这个坑，注释留在 `SettingsScreen.rowWidthFraction`）。
+//   * **行高 / 字号 / 图标大小** → `metrics.sizeDp`（**短边**）比例，和别的屏一致。
+//   * **列表上沿 / 可视高度** → `geometry.sy(...)`（**真实屏高**）与 `geometry.listHeight(...)`，
+//     手机上因此铺满整屏，不会挤在顶部一个方格里。
 //
-// ## 圆屏上四角不会被表壳切到（依据是算式，不是眼睛）
+// ## 为什么空一排也占一行
 //
-// 233dp / 466px 圆屏上逐行实算（直径 233dp，圆心 (116.5, 116.5)）：
-//
-// | 元素 | 纵向区间 | 这一段的圆内宽度 | 实际用的宽度 | 结论 |
-// |---|---|---|---|---|
-// | 返回键所在行 | 23.3 ~ 52.4dp | `min(cwf(0.0725), cwf(0.2525))` = 0.5186 | × `ARC_MARGIN`(0.95) = 0.4927 → 被 `MIN_ROW_WIDTH` 抬到 **0.52** → 行宽 **121.2dp**，行左右端 x = 55.9 / 177.1 | 按键本体只占 41.9dp，整行在圆内；x 和列表屏那颗 ⚙、功能界面那颗 📁 **逐像素相同** |
-// | 应用图标 | 54.8 ~ 92.0dp | 上沿 `cwf(0.235)` = 0.848 → 半宽 98.8dp | 图标 37.3dp 正方、居中（x 97.9 ~ 135.1） | 离圆心**最远**的那个角 √(18.64² + 61.75²) = **64.5dp < 116.5dp**（半径） |
-// | 四行文字 | 117.7 ~ 213.9dp | 每行取自己上下沿里更窄的那处 × 0.93 —— 最紧的是**最后一行** `min(cwf(0.845), cwf(0.930))` = 0.510 | 四行的可用宽度依次是 **213.2 / 203.0 / 156.8 / 110.6dp** | 最紧那一行是"开发者 春羽"（≈76dp）；最长那句"本应用使用 dsh 开发"（≈112dp）待在它自己的 156.8dp 里 |
-//
-// 所以"不被切"这件事来自"每行宽度都是按**它自己那一处的弧宽**算的"，
-// 而不是靠调位置试出来的 —— 换一台密度不同的表（同一块 466px 屏报 d1.0）
-// 这套比例依然成立。
+// 用户第一轮要的"再空一排"在列表里就是**一个没有任何内容的行**（[AboutItem.Kind.GAP]）：
+// 它照样占 [ROW_H] + 行距，所以"空一排"仍然是一个整行的视觉间隔。
+// 不写成 `Arrangement.spacedBy` 的特例，也不用 `Spacer` 塞进 items 里 ——
+// 它是**列表的一项**（有 key、参与交错入场），这样"第几行是什么"在数据里一眼可见。
 //
 // ## 动画（沿用项目语言，**没有新造浮层语言**）
 //
@@ -103,32 +148,32 @@ import kotlin.math.roundToInt
 //     完全相同**的那一条分支（用户点名"动画和打开文件列表一样"，见 `GraphScreen`
 //     里 `softScreenTransition()` 的注释；参数逐字相同：淡入 200ms + 0.94→1 放大 240ms，
 //     出去是淡出 150ms + 1→1.02 放大 150ms，全部 `tween` + `FastOutSlowInEasing`）。
-//   * **屏内这几行依次浮起来**：一个 0→1 的 `appear`（420ms `tween` + `FastOutSlowInEasing`），
-//     每相邻两行错开 40ms；每一行把这个值喂给 [bubbleFade]（alpha + 0.92→1 缩放）。
-//     全程**只动 `graphicsLayer`** —— 位置、字号、命中区在动画期间一个像素都不变
-//     （和 `PressFeedback` / 画布卡片 / 属性屏那条铁律一致）。
-//     为什么要"一个值 + 错开"而不是每行各一个 `animateFloatAsState`：
-//     七行就是七个动画状态、七次每帧失效；这里只有一个状态，行数再多也只有一份开销。
+//   * **列表各行依次浮起来**：和设置页同一套 —— 每行一个 `animateFloatAsState`，
+//     `delay = index × [ROW_STAGGER_MS]`，只喂给 `graphicsLayer{alpha, translationY}`
+//     （位置、字号、命中区在动画期间一个像素都不变）。
 //
 // ## 版本号 / 名字从哪读（**都不写死、都不碰 `build.gradle.kts`**）
 //
 // 全部走 `PackageManager`（见 [readAppInfo]）：
 //   * **应用名字** = `pm.getApplicationLabel(...)` —— 它就是 manifest 的
 //     `android:label="@string/app_name"`，也就是 `strings.xml` 里那个 `app_name`
-//     （本轮按用户要求改成了 `DrawFunc`）。所以"启动器上的名字 / 系统设置里的应用名 /
-//     这一行"三处**同源**，改一次三处一起变。
+//     （`DrawFunc`）。所以"启动器上的名字 / 系统设置里的应用名 / 这一行"三处**同源**。
 //     ⚠️ 这里**没有**用 `stringResource(R.string.app_name)`：`tools\typecheck-ui.ps1`
 //     是"手工拼 classpath + 直接调 K2JVMCompiler"的离线类型检查，**不生成 R 类**，
 //     引用 `R.string.*` 会让它报 unresolved reference（要求是 0 error）。
-//     `getApplicationLabel` 读到的就是同一个字符串，而且顺带不会在
-//     "换 applicationId / 改名"时漏改一处。
-//   * **版本号 / Version Code** = `getPackageInfo(packageName, 0)` 的
-//     `versionName` / `longVersionCode`；**包名用 `context.packageName`，不写死字符串**。
-//   * **图标** = `pm.getApplicationIcon(packageName)` —— 和启动器上那颗是同一张图
-//     （自适应图标的圆形遮罩也由系统自己处理），不引用 `@mipmap/ic_launcher`
-//     （同样是为了不依赖 R 类，而且换图标时这里自动跟着变）。
+//   * **版本号 / Version Code** = `getPackageInfo(packageName, 0)` 的 `versionName` /
+//     `longVersionCode`；**包名用 `context.packageName`，不写死字符串**。
+//   * **图标** = `pm.getApplicationIcon(packageName)` —— 和启动器上那颗是同一张图。
 //   * **任何一步失败都不崩**：整段包在 `runCatching` 里，读不到就显示 `—`（见 [UNKNOWN]）、
 //     图标留一块同尺寸的灰砖占位，版面不会塌。
+//
+// ## 底部那行"bug反馈"
+//
+// 文案逐字取自用户原话（含全角冒号）：[FEEDBACK_TEXT]。
+// 它是**最后一行**，纯文字、不可点 —— 用户只说"加一行字"，没说点它要做事；
+// 手表上也没有能顺利发信的邮件客户端，做成可点反而会让人以为点了会打开什么。
+// ⚠️ 它在圆表上一行放不下（见上面 ASCII 图那段），所以**允许自动折行、胶囊跟着长高**：
+// 用户第二轮原话："bug反馈邮箱那里的条改成如果显示全就不管，显示不全就自动换行。"
 // ---------------------------------------------------------------------------
 
 /** 顶部工具条（返回键那一行）的几何 —— 和 `FunctionList` / `SavesScreen` 同一组数。 */
@@ -143,40 +188,78 @@ private const val ARC_MARGIN = 0.95f
 private const val MIN_ROW_WIDTH = 0.52f
 private const val SQUARE_ROW_WIDTH = 0.90f
 
-// ---- 内容各行的落点（占**真实屏高**；圆表上就是 233dp 的百分之几）----
-/** 应用图标顶（0.235 × 233dp ≈ 54.8dp）：压在返回键那一行（23.3~52.4dp）**下面**，不重叠。 */
-private const val ICON_TOP = 0.235f
-/** 图标边长（占**短边**，控件尺寸那一类）：0.16 × 233dp ≈ 37.3dp。 */
-private const val ICON_SIZE = 0.16f
-/** 应用名（`DrawFunc`）那一行。 */
-private const val NAME_TOP = 0.400f
-/** 版本号那一行。 */
-private const val VERSION_TOP = 0.505f
-/** 文字行之间的**行距**（占真实屏高）：0.085 × 233dp ≈ 19.8dp，比一行 `fontSmall`（行高 17sp）略宽。 */
-private const val LINE_H = 0.085f
+/** 工具条下沿到列表上沿之间留的空（和设置页同一个数）。 */
+private const val LIST_GAP = 0.02f
+/** 列表上沿（占**真实屏高**）：工具条那一行下面一点点。 */
+private const val LIST_TOP = TOOLBAR_TOP + TOOLBAR_H + LIST_GAP
+
 /**
- * 上面这几行是"接着排"的，所以下面三行的落点由 [LINE_H] 推出来 ——
- * 用户那句"再**空一排**"就是 [DSH_TOP] 与 Version Code 之间**整整一个 [LINE_H]**。
+ * 列表下沿（占**真实屏高**，0.90）—— **和设置页同一个数**。
+ *
+ * 它不是"屏高的百分之几"这种随手取的数，而是按圆屏拱口推出来的：圆表上越靠下弦越短，
+ * 一行的宽度被 [MIN_ROW_WIDTH]（0.52 × 233dp = 121.2dp）夹住之后，圆内至少要有
+ * 121.2dp 才装得下 —— `2·√(116.5² − (0.90 × 233 − 116.5)²) = 139.8dp > 121.2dp` 成立，
+ * 而再往下延到 0.95 屏高时只剩 103dp，最后一行就会顶到表壳外面。
+ * 推导与后果写在 `SettingsScreen.LIST_BOTTOM` 的注释里（那边踩过同一个坑）。
  */
-private const val CODE_TOP = VERSION_TOP + LINE_H
-private const val DSH_TOP = CODE_TOP + LINE_H * 2f
-private const val DEV_TOP = DSH_TOP + LINE_H
+private const val LIST_BOTTOM = 0.90f
+
+/**
+ * 行高（占**短边**，0.115 × 233dp ≈ 26.8dp）—— **和设置页逐字相同**。
+ *
+ * 用户明确说过"行高/字号/胶囊尺寸仍按短边缩放，别改"，所以它是"控件尺寸"那一类。
+ */
+private const val ROW_H = 0.115f
+
+/** 行距（占短边）—— 和设置页同一个数（0.010 × 233dp ≈ 2.3dp）。 */
+private const val ROW_GAP = 0.010f
+
+/** 行内文字左右各留一点内边距（占短边，0.026 × 233dp ≈ 6.1dp，和设置行同一个数）。 */
+private const val ROW_SIDE_PAD = 0.026f
+
+/** 图标那一行的高度（占短边）：就是图标自己的边长，行里只放这一张图。 */
+private const val ICON_SIZE = 0.16f
+
+/** 表冠每滚一格滚多少行 —— 和设置页同一个系数。 */
+private const val ROTARY_SCROLL_FACTOR = 1.0f
 
 // ---- 入场 ----
-/** 单行淡入 + 浮起的时长（和其它屏的 220ms 同一个量级）。 */
-private const val IN_MS = 220
-/** 相邻两行错开多久（`FunctionList` / `SavesScreen` 的行入场也是 45ms 这一档）。 */
-private const val STAGGER_MS = 40
-/** 一共几行参与入场（图标 + 名字 + 版本号 + Version Code + dsh + 开发者）。 */
-private const val STAGGER_COUNT = 6
-/** 整段动画的时长：最后一行也走满 [IN_MS]。 */
-private const val APPEAR_MS = IN_MS + (STAGGER_COUNT - 1) * STAGGER_MS
+/** 单行淡入 + 浮起的时长（和设置页各行同一个数）。 */
+private const val ROW_IN_MS = 220
+/** 相邻两行错开多久（设置页是 35ms，同一档）。 */
+private const val ROW_STAGGER_MS = 35
+/** 入场时每行从下方浮起多少（占短边）：0.015 × 233dp ≈ 3.5dp，和设置页相同。 */
+private const val ROW_IN_SLIDE = 0.015f
 
 /** 读不到某样东西时显示什么（用户提过"显示 `—` 之类"，**绝不崩**）。 */
 private const val UNKNOWN = "—"
 
 /** 连应用名都读不出来时的最后兜底（正常情况下读得到，见 [readAppInfo]）。 */
 private const val NAME_FALLBACK = "DrawFunc"
+
+/** 列表最后一行：bug 反馈邮箱（**逐字**取自用户原话，含全角冒号）。 */
+private const val FEEDBACK_TEXT = "bug反馈：drawfunc@163.com"
+
+/**
+ * 列表里的一项。
+ *
+ * 为什么用"数据 + 类型"而不是把八行硬写在 `LazyColumn` 里：行的**顺序**就是版面，
+ * 写成一份数据之后"加一行/换文案"只动一处（底部那行 `bug反馈` 本轮就是这么加的），
+ * 而且 `itemsIndexed` 的 key、交错入场的序号都能直接从它推出来。
+ */
+private class AboutItem(val key: String, val kind: Kind, val text: String = "") {
+    /**
+     * 这一行画成什么样子：
+     *   * [ICON] 图标那一行（只有图标，没有胶囊底）；
+     *   * [TITLE] 应用名（`fontTitle`、纯白）；
+     *   * [MUTED] 版本 / Version Code / dsh（`fontSmall`、80% 白）；
+     *   * [BODY] 开发者那一行（`fontSmall`、纯白 —— 这一屏的"收尾句"）；
+     *   * [FEEDBACK] 最后那行 bug 反馈邮箱：**和 [MUTED] 同色同字号，但放不下时自动折成两行**
+     *     （用户原话："如果显示全就不管，显示不全就自动换行"）；
+     *   * [GAP] 用户要的"空一排"：一个**没有任何内容**的行（照样占一行的高度）。
+     */
+    enum class Kind { ICON, TITLE, MUTED, BODY, FEEDBACK, GAP }
+}
 
 /**
  * 「应用信息」页。
@@ -187,11 +270,15 @@ private const val NAME_FALLBACK = "DrawFunc"
  * 这一屏只管"长什么样"）。
  *
  * @param onBack 左上角返回键：回函数列表（和系统返回键同一个落点）。
+ * @param rotary 表冠 / 滚轮事件流：这一屏现在是**可滚动列表**，表冠要能滚它
+ *   （接法和 `FunctionList` / `SavesScreen` / `SettingsScreen` 一字不差）。
+ *   默认值让"没补这一行也能编译、也能跑"，只是表冠滚不动。
  */
 @Composable
 fun AboutScreen(
     metrics: WatchMetrics,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    rotary: Flow<Float> = emptyFlow()
 ) {
     val context = LocalContext.current
     val density = LocalDensity.current
@@ -210,25 +297,36 @@ fun AboutScreen(
         runCatching { drawableToBitmap(drawable, px) }.getOrNull()
     }
 
-    // 入场的总进度：0 → 1 一次性播一遍（`LaunchedEffect(Unit)`，回到这一屏时重播一次）。
+    // 列表内容：**顺序就是版面**（图标 → 名字 → 版本 → Version Code → 空一排 →
+    // dsh → 开发者 → bug反馈）。加行/改文案只动这一处。
+    val items = remember(info) {
+        listOf(
+            AboutItem("icon", AboutItem.Kind.ICON),
+            AboutItem("name", AboutItem.Kind.TITLE, info.name),
+            AboutItem("version", AboutItem.Kind.MUTED, "版本 ${info.versionName}"),
+            AboutItem("code", AboutItem.Kind.MUTED, "Version Code ${info.versionCode}"),
+            AboutItem("gap", AboutItem.Kind.GAP),
+            AboutItem("dsh", AboutItem.Kind.MUTED, "本应用使用 dsh 开发"),
+            AboutItem("dev", AboutItem.Kind.BODY, "开发者 春羽"),
+            // ---- 本轮新增：用户要的"应用列表底部加一行字" ----
+            // ⚠️ 它用的是 [AboutItem.Kind.FEEDBACK] 而不是 MUTED：这一行在圆表上装不下，
+            //    要允许它自动折成两行（用户原话："如果显示全就不管，显示不全就自动换行"）。
+            AboutItem("feedback", AboutItem.Kind.FEEDBACK, FEEDBACK_TEXT)
+        )
+    }
+
+    // 入场的总开关：进这一屏后置 true，各行按序号错开淡入（同设置页那套）。
     var entered by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { entered = true }
-    val appear by animateFloatAsState(
-        targetValue = if (entered) 1f else 0f,
-        animationSpec = tween(durationMillis = APPEAR_MS, easing = FastOutSlowInEasing)
-    )
 
-    /**
-     * 第 [index] 行的进场进度（0~1）：在整段 [APPEAR_MS] 里错开 `index × [STAGGER_MS]`。
-     *
-     * 算式说明：整段时长已经预留了"错开完还够最后一行走满 [IN_MS]"，
-     * 所以第 index 行的起点比例 `d = index × STAGGER / APPEAR`，
-     * 它自己的进度就是把 `[d, 1]` 这一段重新映射回 `[0, 1]` —— 于是每一行都是
-     * **同样 220ms、同样缓动**的一次浮入，只是起跑时间不同。
-     */
-    fun stage(index: Int): Float {
-        val d = (index * STAGGER_MS).toFloat() / APPEAR_MS
-        return ((appear - d) / (1f - d)).coerceIn(0f, 1f)
+    val listState = rememberLazyListState()
+
+    // ---- 表冠：这一屏只用来滚动列表（缩放图像是图像界面的事）----
+    // 往下拨 = 往下滚；手指直接拖列表也照常能滚（`LazyColumn` 自带的手势），互不干扰。
+    LaunchedEffect(rotary) {
+        rotary.collect { amount ->
+            listState.scrollBy(-amount * ROTARY_SCROLL_FACTOR)
+        }
     }
 
     BoxWithConstraints(
@@ -242,6 +340,25 @@ fun AboutScreen(
             .background(MaterialTheme.colors.background)
     ) {
         val geometry = rememberScreenGeometry(maxWidth, maxHeight, metrics)
+        val listTopPx = with(density) { geometry.sy(LIST_TOP).toPx() }
+        val screenHeightPx = with(density) { geometry.screenH.toPx() }
+
+        /**
+         * 列表可视区高度 —— **和设置页逐字同一套**（`SettingsScreen.listHeight`）。
+         *
+         *   * 圆屏：`sy(LIST_BOTTOM) − sy(LIST_TOP)`。这里**刻意不给圆屏"铺到屏幕底部"**：
+         *     [LIST_BOTTOM] = 0.90 是按圆屏拱口（越靠下弦越短）反推出来的几何结论 ——
+         *     再往下延，滚到底的那一行会被夹到 [MIN_ROW_WIDTH]（0.52）而圆内实际只剩
+         *     103dp（0.95 屏高处），行的两个角就伸到表壳外面去了（用户那条宽度规则
+         *     里点名的坑）。0.90 处圆内宽度是 139.8dp > 121dp，最后一行仍然整个在圆内。
+         *   * 非圆屏：一路铺到屏幕底边、只留 `LIST_BOTTOM_PAD`（`ScreenGeometry.listHeight`）
+         *     —— 手机上因此"铺满整屏"，不会挤在顶部一个方格里。
+         */
+        val listHeight = if (isRound) {
+            geometry.sy(LIST_BOTTOM) - geometry.sy(LIST_TOP)
+        } else {
+            geometry.listHeight(metrics, geometry.sy(LIST_TOP))
+        }
 
         // ---- ① 返回键：左上角，和「函数文件」列表、属性屏那颗在**同一处** ----
         //
@@ -255,7 +372,6 @@ fun AboutScreen(
         // 按键**本体**的尺寸不在这里定：它是 `WatchIconButton` 那一类
         // **形状锁定**的图标键（宽 0.18 短边、高 × `ICON_BTN_ASPECT`），
         // 这是 README「硬约定」里唯一的例外（用户更早的要求："让按键强制保持在一个形状"）。
-        // 真正自适应的是它所在的这一行 —— 所以手机上按钮旁边不会留出莫名其妙的空隙。
         Box(
             modifier = Modifier
                 .align(Alignment.TopCenter)
@@ -268,7 +384,6 @@ fun AboutScreen(
                     )
                 )
                 .height(metrics.sizeDp * TOOLBAR_H),
-            // 左端顶左：和列表屏的 ⚙ 同一个 x。
             contentAlignment = Alignment.CenterStart
         ) {
             WatchIconButton(
@@ -279,16 +394,117 @@ fun AboutScreen(
             )
         }
 
-        // ---- ② 应用图标（用户念的第一行）----
-        Box(
+        // ---- ② 内容列表（图标 + 七行）----
+        //
+        // 三件和设置页/函数列表对齐的事：
+        //   1. 容器 `fillMaxWidth()`，**行自己**按所在高度的弧宽收窄并居中
+        //      （靠 `horizontalAlignment`），行宽按"这一行**此刻**在屏幕上的高度"算；
+        //   2. 行距交给 `Arrangement.spacedBy(ROW_GAP)`，不自己塞占位行；
+        //   3. `key` 用 [AboutItem.key]：滚动回收重建时行不会认错自己，
+        //      也不会把"另一行的入场进度"套到这一行上。
+        LazyColumn(
+            state = listState,
             modifier = Modifier
                 .align(Alignment.TopCenter)
-                .offset(y = geometry.sy(ICON_TOP))
-                .size(iconSize)
-                // 入场：alpha + 0.92→1 的缩放，**只动图层**
-                .bubbleFade(alpha = stage(0), scale = 0.92f + 0.08f * stage(0))
+                // 上沿按**真实屏高**（圆屏上逐像素不变）
+                .offset(y = geometry.sy(LIST_TOP))
+                .fillMaxWidth()
+                // 左右余量只在非圆屏上生效：圆屏上行宽本来就是按弧宽收过的
+                // （最宽 0.90 屏宽，离屏幕边还有 0.05 屏宽），再加边距等于把圆表上的行
+                // 又缩窄一圈 —— 圆屏这一支一点都不能动（和 `SettingsScreen` /
+                // `FunctionsScreen` 里那两处 `.padding(horizontal = if (isRound) 0.dp else ...)`
+                // 同一个做法）。
+                .padding(horizontal = if (isRound) 0.dp else geometry.sx(ROW_SIDE_INSET))
+                // 高度 = 圆屏取到 [LIST_BOTTOM]（按拱口反推）、非圆屏铺到屏幕底
+                // （见上面 `listHeight` 的那段推导）
+                .height(listHeight),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(metrics.sizeDp * ROW_GAP)
         ) {
-            val bitmap = iconBitmap
+            itemsIndexed(items, key = { _, item -> item.key }) { index, item ->
+                val widthFraction = rowWidthFraction(
+                    listState = listState,
+                    itemKey = item.key,
+                    listTopPx = listTopPx,
+                    screenPx = screenHeightPx,
+                    metrics = metrics,
+                    isRound = isRound
+                )
+                when (item.kind) {
+                    // 图标那一行：只有图标，没有胶囊底（它不是"一条信息"，是这一屏的门面）
+                    AboutItem.Kind.ICON -> AboutIconRow(
+                        bitmap = iconBitmap,
+                        iconSize = iconSize,
+                        index = index,
+                        entered = entered,
+                        metrics = metrics,
+                        widthFraction = widthFraction,
+                        geometry = geometry,
+                        isRound = isRound
+                    )
+                    // "空一排"：占位行，什么都不画（用户第一轮的原话）
+                    AboutItem.Kind.GAP -> AboutGapRow(
+                        metrics = metrics,
+                        widthFraction = widthFraction,
+                        geometry = geometry,
+                        isRound = isRound
+                    )
+                    else -> AboutTextRow(
+                        text = item.text,
+                        kind = item.kind,
+                        metrics = metrics,
+                        widthFraction = widthFraction,
+                        geometry = geometry,
+                        isRound = isRound,
+                        index = index,
+                        entered = entered
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 图标那一行（列表第一项）。
+ *
+ * 行高就是图标自己的边长（[ICON_SIZE] × 短边），**没有胶囊底** ——
+ * 它是这一屏的门面，不是"一条信息"。宽度仍然按这一行的弧宽收窄：
+ * 图标本身很小（233dp 表上 37.3dp），收窄只是保证它在圆内居中，
+ * 不会出现"图标跑到表壳切掉的那两块里"。
+ */
+@Composable
+private fun AboutIconRow(
+    bitmap: ImageBitmap?,
+    iconSize: Dp,
+    index: Int,
+    entered: Boolean,
+    metrics: WatchMetrics,
+    widthFraction: Float,
+    geometry: ScreenGeometry,
+    isRound: Boolean
+) {
+    val reveal by animateFloatAsState(
+        targetValue = if (entered) 1f else 0f,
+        animationSpec = tween(
+            durationMillis = ROW_IN_MS,
+            delayMillis = index * ROW_STAGGER_MS,
+            easing = FastOutSlowInEasing
+        )
+    )
+
+    Box(
+        modifier = Modifier
+            .width(geometry.rowWidth(metrics, widthFraction, isRound))
+            .height(iconSize)
+            // 入场只动图层：位置 / 尺寸 / 命中区一个像素都不变
+            .graphicsLayer {
+                alpha = reveal
+                translationY = (1f - reveal) * metrics.sizeDp.toPx() * ROW_IN_SLIDE
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        Box(modifier = Modifier.size(iconSize)) {
             if (bitmap != null) {
                 Image(
                     bitmap = bitmap,
@@ -307,141 +523,171 @@ fun AboutScreen(
                 )
             }
         }
-
-        // ---- ③④⑤⑥⑦ 五行文字（名字 / 版本号 / Version Code / 空一排 / dsh / 开发者）----
-        //
-        // 名字用 `fontTitle` + 纯白（这一屏最重要的信息），其余用 `fontSmall`；
-        // 版本号那两行压到 80% 白（`KeyPalette.textMuted`）做出层次，
-        // 最后那句"开发者 春羽"再回到纯白收尾。
-        // 颜色全部来自 `KeyPalette`（和整屏的按键文字同一套），没有新造色。
-        AboutLine(
-            text = info.name,
-            top = NAME_TOP,
-            fontSize = metrics.fontTitle,
-            color = KeyPalette.text,
-            appear = stage(1),
-            metrics = metrics,
-            geometry = geometry,
-            isRound = isRound
-        )
-        AboutLine(
-            text = "版本 ${info.versionName}",
-            top = VERSION_TOP,
-            fontSize = metrics.fontSmall,
-            color = KeyPalette.textMuted,
-            appear = stage(2),
-            metrics = metrics,
-            geometry = geometry,
-            isRound = isRound
-        )
-        AboutLine(
-            text = "Version Code ${info.versionCode}",
-            top = CODE_TOP,
-            fontSize = metrics.fontSmall,
-            color = KeyPalette.textMuted,
-            appear = stage(3),
-            metrics = metrics,
-            geometry = geometry,
-            isRound = isRound
-        )
-        // ⚠️ 这里**故意什么都不画**：用户要的"再空一排"就是 [CODE_TOP] 和 [DSH_TOP]
-        // 之间那整整一个 [LINE_H]（圆表上 ≈19.8dp）。用一个 Spacer 也能表达，
-        // 但"空一排"是两个落点之差，写成常量比多一个不可见的组件更清楚。
-        AboutLine(
-            text = "本应用使用 dsh 开发",
-            top = DSH_TOP,
-            fontSize = metrics.fontSmall,
-            color = KeyPalette.textMuted,
-            appear = stage(4),
-            metrics = metrics,
-            geometry = geometry,
-            isRound = isRound
-        )
-        AboutLine(
-            text = "开发者 春羽",
-            top = DEV_TOP,
-            fontSize = metrics.fontSmall,
-            color = KeyPalette.text,
-            appear = stage(5),
-            metrics = metrics,
-            geometry = geometry,
-            isRound = isRound
-        )
     }
 }
 
 /**
- * 这一屏的一行文字。
+ * "空一排"（用户第一轮原话要的那个整行间隔）。
  *
- * ## 它为什么是 `BoxScope` 的扩展
- *
- * 因为它要 `Modifier.align(Alignment.TopCenter)`（这一屏所有元素都是"水平居中 + 各自
- * 一个纵向落点"，没有用 `Column` 串起来 —— 每行的落点是**独立常量**，
- * 串成 Column 之后"空一排"就变成"往 Column 里塞一个 Spacer"，多一层不可见的组件，
- * 也让"某一行挪动"要连带改后面所有行）。`align` 只在 `BoxScope` 里可用，
- * 所以这个私有 composable 也声明成 `BoxScope` 的扩展 ——
- * `BoxWithConstraints` 的内容就是一个 `BoxScope`，因此调用点不用做任何转换。
- *
- * ## 宽度（用户那条长期规则）
- *
- * 文字**不是可点控件**，所以这里只做两件事：**宽度按真实可用宽度自适应 + 居中**，
- * 不写死任何 dp：
- *   * 圆屏：`bandWidth(...)` 取这一行上下沿里更窄的那处弧宽 × 0.93 ——
- *     文字因此永远待在圆内（表壳切不到）；
- *   * 非圆屏（手机 / 方表）：`ScreenGeometry.rowWidth` 给"屏宽 − 左右各 3%"，
- *     一行字铺满可用宽度、居中排版（手机上不会缩成一根窄柱）。
- * 行高**不设**（`Text` 自己按字号撑高），落点由 `offset(y = geometry.sy(top))` 决定 ——
- * 这样任何系统字体缩放下都不会出现"字被盒子的高度切掉"。
- *
- * @param top 这一行的落点（占**真实屏高**）——调用方给的都是上面那批常量。
+ * 它**有行高、没有内容、没有胶囊底**：占位靠的是 `Modifier.height(ROW_H)`，
+ * 于是它和别的行一样被 `spacedBy` 隔开，"空一排"就是**一个整行的视觉间隔**。
+ * 没有用 `Spacer` 塞进 items 里：那样它就没有 key、不参与交错入场，
+ * 而这里它是**列表的一项**（"第几行是什么"在数据里一眼可见）。
  */
 @Composable
-private fun BoxScope.AboutLine(
-    text: String,
-    top: Float,
-    fontSize: TextUnit,
-    color: Color,
-    appear: Float,
+private fun AboutGapRow(
     metrics: WatchMetrics,
+    widthFraction: Float,
     geometry: ScreenGeometry,
     isRound: Boolean
 ) {
-    Text(
-        text = text,
-        fontSize = fontSize,
-        color = color,
-        textAlign = TextAlign.Center,
-        // 一行就够（最长那句"本应用使用 dsh 开发"在圆表上 ≈112dp，那一行的可用宽度
-        // 是 156.8dp —— 逐行实算见文件头那张表）；万一将来文案变长，
-        // 省略号比"换行把版面撑破"安全。
-        maxLines = 1,
-        overflow = TextOverflow.Ellipsis,
+    Box(
         modifier = Modifier
-            .align(Alignment.TopCenter)
-            .offset(y = geometry.sy(top))
-            .width(
-                bandWidth(
-                    metrics = metrics,
-                    geometry = geometry,
-                    isRound = isRound,
-                    yTop = top,
-                    // 下沿多算一个行距：弧宽是"越往下越窄"，取更窄的那一处更保守
-                    // （分段控件最容易被切的是下沿的角，见 `MathKeyboard.bandWidth`）。
-                    yBottom = top + LINE_H
+            .width(geometry.rowWidth(metrics, widthFraction, isRound))
+            .height(metrics.sizeDp * ROW_H)
+    )
+}
+
+/**
+ * 一行文字（应用名 / 版本号 / Version Code / dsh / 开发者 / bug反馈）。
+ *
+ * 装在一颗**深灰胶囊**里，配色与设置行、函数列表行、键盘按键同一套（`KeyPalette.normal`）——
+ * 用户要的是"改成列表"，而这个 App 里"列表"的视觉语言就是这种整行胶囊。
+ * 文字**居中**（这一屏是"信息展示"，不是"设置项"那种标题在左、取值在右的排版）。
+ *
+ * ## 高度：默认钉死一行，**只有 bug反馈那一行按内容长**
+ *
+ * 用户原话（本轮）："bug反馈邮箱那里的条改成**如果显示全就不管，显示不全就自动换行**。"
+ *
+ * 这句话落到实现上就是 [AboutItem.Kind.FEEDBACK] 那一行（[wrap] = true）：
+ *   * **高度用 `heightIn(min = ROW_H)` 而不是 `height(ROW_H)`** ——
+ *     一行装得下时它就停在最小高度（和别的行**逐像素相同**，用户说的"显示全就不管"）；
+ *     装不下时 [Text] 自己折成两行，胶囊跟着内容变高（`LazyColumn` 的 item 高度本来就按内容算，
+ *     所以不会和邻居打架）；
+ *   * 其余各行仍然 `height(ROW_H)` 钉死 + `maxLines = 1` + 省略号：
+ *     它们都是一眼能读完的短句，让它们随便换行只会把这一屏的节奏打乱。
+ *
+ * ## 为什么最多两行、为什么这样一定放得下
+ *
+ * 233dp 圆表上这一行最窄是 `0.52 × 233 ≈ 121dp`，减去左右各 6.1dp 内边距只剩 ≈109dp；
+ * 而 `bug反馈：drawfunc@163.com` 在 12.1sp 下约 134dp —— **一行确实放不下**（用户看到的截断）。
+ * 但它的折行点正好在全角冒号之后（CJK 标点后面允许断行）：
+ *   * 第一行 `bug反馈：` ≈ 30dp；
+ *   * 第二行 `drawfunc@163.com` ≈ 104dp ≤ 109dp；
+ * 所以 **2 行一定够**，`maxLines = 2` 不会是"换个地方继续截断"。
+ * 万一将来文案更长，第 3 行会以省略号收尾（宁可省略号，也不让某一行把整屏撑成一面墙）。
+ */
+@Composable
+private fun AboutTextRow(
+    text: String,
+    kind: AboutItem.Kind,
+    metrics: WatchMetrics,
+    widthFraction: Float,
+    geometry: ScreenGeometry,
+    isRound: Boolean,
+    index: Int,
+    entered: Boolean
+) {
+    // 应用名是这一屏最重要的信息（`fontTitle` + 纯白），其余按"是不是收尾句"分两档：
+    // 开发者那行纯白收尾，版本号那几行压到 80% 白（`KeyPalette.textMuted`）做出层次。
+    // 颜色全部来自 `KeyPalette`（和整屏的按键文字同一套），没有新造色。
+    val fontSize: TextUnit = if (kind == AboutItem.Kind.TITLE) metrics.fontTitle else metrics.fontSmall
+    // 应用名和"开发者 春羽"（这一屏的收尾句）用纯白；版本号 / Version Code / dsh /
+    // bug反馈 压到 80% 白（`KeyPalette.textMuted`）做出层次。
+    val color: Color =
+        if (kind == AboutItem.Kind.TITLE || kind == AboutItem.Kind.BODY) KeyPalette.text
+        else KeyPalette.textMuted
+    // 只有 bug反馈那一行允许换行/长高（见上面那段"高度"）
+    val wrap = kind == AboutItem.Kind.FEEDBACK
+
+    val reveal by animateFloatAsState(
+        targetValue = if (entered) 1f else 0f,
+        animationSpec = tween(
+            durationMillis = ROW_IN_MS,
+            delayMillis = index * ROW_STAGGER_MS,
+            easing = FastOutSlowInEasing
+        )
+    )
+
+    Surface(
+        color = KeyPalette.normal,
+        shape = PillShape,
+        modifier = Modifier
+            .width(geometry.rowWidth(metrics, widthFraction, isRound))
+            // 换行那一行：`heightIn(min = 行高)`，装得下就是一行的高度、装不下跟着内容长
+            .then(
+                if (wrap) Modifier.heightIn(min = metrics.sizeDp * ROW_H)
+                else Modifier.height(metrics.sizeDp * ROW_H)
+            )
+            .graphicsLayer {
+                alpha = reveal
+                translationY = (1f - reveal) * metrics.sizeDp.toPx() * ROW_IN_SLIDE
+            }
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Text(
+                text = text,
+                fontSize = fontSize,
+                color = color,
+                textAlign = TextAlign.Center,
+                // ⚠️ 这里**不再**写死 `maxLines = 1`：bug反馈那一行放不下时要折成两行
+                //（用户本轮的要求）。其余各行仍然是"一行 + 省略号"，
+                // 因为它们的文案都是一眼能读完的短句。
+                maxLines = if (wrap) 2 else 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(
+                    horizontal = metrics.sizeDp * ROW_SIDE_PAD,
+                    // 只有会长高的那一行需要纵向内边距（两行文字贴着胶囊边不好看）；
+                    // 别的行高度是钉死的，加了也只是把居中的文字原地不动地留点余量。
+                    vertical = if (wrap) metrics.sizeDp * ROW_SIDE_PAD else 0.dp
                 )
             )
-            // 入场：只动图层（alpha），位置/字号/命中区一个像素都不动。
-            // ⚠️ 必须写在 `.width(...)` **右边**（内层）—— `graphicsLayer` 只影响它
-            // 内层画的东西，写在左边会让这一段高度里的内容在淡出时露出来
-            // （`Common.bubbleFade` 的 KDoc 记着这个坑）。
-            .bubbleFade(alpha = appear)
-    )
+        }
+    }
+}
+
+/**
+ * 圆屏上这一行的宽度比例（占屏宽）。
+ *
+ * **和 `SettingsScreen.rowWidthFraction` / `FunctionList.rowWidthFraction` /
+ * `SavesScreen.rowWidthFraction` 逐字同一套**（这是第四份副本 —— 那三份都是 `private`；
+ * 收敛成一处是"改那三屏"的活，不该由这一屏顺手做掉，理由和 [toolbarWidthFraction] 一样）：
+ *   * 按这一行**此刻**在屏幕上的高度取圆内宽度 × [ARC_MARGIN]，夹在
+ *     [MIN_ROW_WIDTH] ~ [SQUARE_ROW_WIDTH] 之间；
+ *   * **量化到百分位**（`round(raw * 100) / 100`）再包 `derivedStateOf`：
+ *     `LazyListState.layoutInfo` 滚动时每帧都在变，量化之后只有"宽度真的变了"才重组；
+ *   * 查不到这一项（还没测到、或已滚出屏幕）退回 [SQUARE_ROW_WIDTH]；
+ *   * 非圆屏返回 1f 当占位，真实宽度由 `geometry.rowWidth` 给"屏宽 − 左右各 3%"。
+ */
+@Composable
+private fun rowWidthFraction(
+    listState: LazyListState,
+    itemKey: Any,
+    listTopPx: Float,
+    screenPx: Float,
+    metrics: WatchMetrics,
+    isRound: Boolean
+): Float {
+    if (!isRound) return 1f
+    val fraction by remember(itemKey) {
+        derivedStateOf {
+            val info = listState.layoutInfo.visibleItemsInfo
+                .firstOrNull { it.key == itemKey }
+                ?: return@derivedStateOf SQUARE_ROW_WIDTH
+            // 这一行的中心落在屏幕高度的百分之几处
+            val centerY = (listTopPx + info.offset + info.size / 2f) / screenPx
+            val raw = metrics.circleWidthFraction(centerY) * ARC_MARGIN
+            (round(raw * 100f) / 100f)
+                .coerceIn(MIN_ROW_WIDTH, SQUARE_ROW_WIDTH)
+        }
+    }
+    return fraction
 }
 
 /**
  * 顶部那一行的宽度比例（占屏宽）。
  *
- * **逐字照抄 `FunctionList.toolbarWidthFraction`**（`SavesScreen` 里也有一份同样的副本）：
+ * **逐字照抄 `FunctionList.toolbarWidthFraction`**（`SavesScreen` / 本文件里各有一份副本）：
  * 取这一行**上下两端里更窄**的那处圆内宽度 × [ARC_MARGIN]，再夹在
  * [MIN_ROW_WIDTH] ~ [SQUARE_ROW_WIDTH] 之间。
  *
@@ -454,10 +700,6 @@ private fun BoxScope.AboutLine(
  *
  * 非圆屏那一支返回 1f 当占位，真实宽度由 `ScreenGeometry.rowWidth` 给"屏宽 − 左右各 3%"
  * （和列表行、其它屏的工具条同一个口径：**圆屏走弧宽、非圆屏走满宽**）。
- *
- * ⚠️ 这里是**第三份副本**（`FunctionList` / `SavesScreen` / 本文件）。没有抽成共用函数，
- * 是因为那两个文件里的同名函数是 `private`，而它们各自的注释里都记着同一句取舍；
- * 真要把三处收敛成一处，是"改那两屏"的活，不该由这一屏顺手做掉。
  */
 private fun toolbarWidthFraction(metrics: WatchMetrics, isRound: Boolean): Float {
     if (!isRound) return 1f
@@ -478,9 +720,9 @@ private fun toolbarWidthFraction(metrics: WatchMetrics, isRound: Boolean): Float
 private class AppInfo(
     /** 应用名：manifest 的 `android:label` → `strings.xml` 的 `app_name`（现在是 `DrawFunc`）。 */
     val name: String,
-    /** `versionName`（`app/build.gradle.kts` 里现在写的是 `1.0`）。读不到就是 [UNKNOWN]。 */
+    /** `versionName`（`app/build.gradle.kts` 里现在写的是 `1.1`）。读不到就是 [UNKNOWN]。 */
     val versionName: String,
-    /** `versionCode`（现在是 `1`）。读不到就是 [UNKNOWN]。 */
+    /** `versionCode`（现在是 `3`）。读不到就是 [UNKNOWN]。 */
     val versionCode: String,
     /** 启动器图标；读不到就是 null（界面上留一块同尺寸的灰砖占位）。 */
     val icon: Drawable?

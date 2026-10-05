@@ -168,9 +168,10 @@ private const val ROTARY_SCROLL_FACTOR = 1.0f
  */
 private const val DOUBLE_TAP_MS = 300L
 
-/** 删除后的"撤销条"停留多久（和函数列表那边一样 4 秒）。 */
-// 用户要求：撤销条只留 2 秒（原来 4 秒）
-private const val UNDO_MS = 2000L
+// 这里原来有一个 `UNDO_MS`（删除后那颗"已删除 N 个 · 点此撤销"胶囊停留 2 秒）。
+// 用户这一轮要求"把所有撤销的 **toast 提示**都给删掉" —— 这一屏那颗胶囊就是一条
+// 带撤销的提示，所以它连同 `UNDO_MS` / `deleted` / `lastBatch` 整套一起删掉了。
+// **删除本身的过渡一点没动**（那套是 `dying` + `ROW_OUT_MS`，和撤销无关，见 [deleteSelected]）。
 
 /**
  * **文件夹图标**（用户要求"图标是文件夹"）。
@@ -238,7 +239,7 @@ internal val FolderIcon: ImageVector by lazy {
  * | 普通 | **双击一个文件**（第二下在 300ms 内） | 弹**重命名**对话框（第一下已经把它选中了） |
  * | 普通 | **长按一个文件** | 进入多选模式，并且**这个文件被选中** |
  * | 多选 | 工具栏**左**：取消（×，`Icons.Filled.Close`） | 退出多选、清空选择、**不删任何东西** |
- * | 多选 | 工具栏**右**：删除（红色垃圾桶 + `HoldToConfirm` 线圈）—— **按住转满一圈才生效**，短按不做事 | 删除**所有选中项** → 退出多选 + 清空选择 + toast + 撤销条 |
+ * | 多选 | 工具栏**右**：删除（红色垃圾桶 + `HoldToConfirm` 线圈）—— **按住转满一圈才生效**，短按不做事 | 删除**所有选中项** → 退出多选 + 清空选择 + 一条**纯提示**的 toast（**没有撤销条**：用户要求删掉所有撤销提示，删除这一步现在不可回退，所以那圈线圈是唯一的防线） |
  * | 多选 | **点一个文件**（含已选中的） | 切换该行的选中状态（＝多选） |
  * | 多选 | **长按一个文件** | 同上：切换该行的选中状态（长按已选中的＝取消选中） |
  * | 多选 | **双击一个文件** | 不做事（重命名只在普通模式；避免和"多选"这件事抢手势） |
@@ -275,6 +276,35 @@ internal val FolderIcon: ImageVector by lazy {
  * 这两个浮窗都居中 / 按钮在输入框下面 / 图标是 × 和 ✓ / 唤起时有动画 ——
  * 两份实现各改一遍必然会漂，所以复制品删掉，两个入口共用 `SaveImageDialog.kt` 里那一个。
  *
+ * ## 重命名浮窗里那颗「导出文件」（本轮新增，用户点名）
+ *
+ * 用户原话："再给文件列表里面的重命名浮窗里面再加个导出文件的按钮，点击之后会在下载文件夹
+ * 里面的 DrawFunc 文件夹里面导出这个文件，如果没有 DrawFunc 文件夹自动创建。"
+ *
+ * 第二版用户又补了一句："保存按钮和 ×✓ 不要在同一行，另起一行。" —— 所以它现在**独占一行**
+ * （整行宽的胶囊 + 手画的 ⤓ 图标 + 文字"导出文件"），×/✓ 回到平分整行。版面的重算、
+ * 三块屏的数值表、以及"四角为什么还在圆内"的算式都写在 `SaveImageDialog.kt` 的 KDoc 里。
+ *
+ * 链路只有三段：**这一屏**（谁在改名、toast 走 `onMessage`）→ [DownloadExport]
+ * （`MediaStore` 那一套，整段 `Dispatchers.IO`）→ [FileExport]（纯规则：名字 / 撞名 /
+ * 失败文案，离线有测试）。源文件只被**读**了一次（`File.readBytes`，按字节复制、
+ * 不经编解码），写的是下载目录里的**新**文件 —— 所以这条链路**不可能**改坏 App 存档
+ * 或当前文件。
+ *
+ * 四条有意定下来的行为（细节见 `FileExport` 的注释）：
+ *
+ *   1. **用输入框里"此刻"的文本**，不是磁盘上的原名：用户可能刚改完名字还没按 ✓，
+ *      这时导出应该是"我现在看到的这个名字"；草稿为空才退回原名，非法才拒绝
+ *      （拒绝用的是和重命名**同一句**提示，不会出现"改名不让用、导出却让用"）；
+ *   2. 目标文件夹里撞名 → **加序号（`名字 (2).fdf`）不覆盖**：导出是备份 / 分享语义，
+ *      覆盖会让人措手不及，而且导出这条路没有撤销；
+ *   3. 导出**不关浮窗**：用户可能接着改名，关掉反而要重新双击进来看；
+ *   4. 导出挂在**这一屏**的 scope 上（见 [exporting]）：浮窗被关掉也不打断写盘。
+ *
+ * API 29 以下（minSdk 24 的老表 / 老手机）**有意**只给一句"当前安卓版本不支持导出到下载目录
+ * （需要 Android 10 及以上）"的提示，不去申请 `WRITE_EXTERNAL_STORAGE` ——
+ * 理由与影响面写在 `DownloadExport` 的类注释里。
+ *
  * ## 删掉了什么
  *
  *   * **左滑删除取消**（用户要求）：删除统一走多选 + 长按垃圾桶线圈这一条路，
@@ -294,9 +324,11 @@ internal val FolderIcon: ImageVector by lazy {
  *     `ARC_MARGIN`，取"按钮上下沿里更窄的那个"）—— 233dp 圆屏上从写死的 158.9dp
  *     收到 **121.2dp**，按钮的外上角不再被表壳切掉。数值和 `FunctionList` /
  *     `FunctionsScreen` **完全同一组**，三屏的两颗按钮严丝合缝地对齐；
- *   * **撤销条**（0.835 屏高那颗胶囊）没改：它是个**整颗胶囊**，左右两端是半圆，
- *     半圆的最外点算下来离圆心 116.7dp ≈ 半径 116.5dp，本来就贴着圆弧走，
- *     再收窄只会比函数列表那一屏的撤销条更窄、反而不一致。
+ *   * **撤销条已删除**（本轮）：它原来是 0.835 屏高那颗"已删除 N 个 · 点此撤销"胶囊。
+ *     用户要求"把所有撤销的 toast 提示都给删掉"，所以整颗（连同它背后的
+ *     `deleted` / `lastBatch` / `UNDO_MS` 状态与 2 秒过期计时）一起删了 ——
+ *     不是隐藏，是不进组合。宽度那笔账（半圆最外点离圆心 116.7dp ≈ 半径 116.5dp）
+ *     随之作废，不必再算。
  *
  * ## 动画（用户原话："以上所有功能的添加或修改都需要适合这个软件的丰富美观的动画"）
  *
@@ -308,7 +340,6 @@ internal val FolderIcon: ImageVector by lazy {
  * | 行选中 / 取消选中 | 底色 深灰 ↔ 强调色渐变 | 160ms 同上（和功能界面选中 chip 同节奏） |
  * | 行尾 ✓ 角标 | alpha 0 ↔ 1 + 0.6 ↔ 1.0 缩放（**位置永远占着**，文字不会横跳） | 170ms 同上 |
  * | 删除 | 选中的行淡出 + 缩到 0.9，**播完才**重读目录；其余行位移合拢 | 180ms 淡出 / 220ms 位移 |
- * | 撤销条 | 淡入 + 从上滑入一半高度 | 180ms + 220ms（既有） |
  * | 空状态 | 淡入 + 0.92 → 1 缩放；第一个文件存进来时反向淡出 | 220ms / 150ms 同上 |
  */
 @Composable
@@ -347,26 +378,20 @@ fun SavesScreen(
     var renameError by remember { mutableStateOf<String?>(null) }
 
     /**
-     * 刚删掉的那批文件（连同**内容**，为了能撤销）。
+     * 「导出文件」（写进 `Download/DrawFunc/`）**正在进行中**。
      *
-     * 为什么把内容留在内存里而不是"先改个 .trash 后缀、撤销时再改回来"：
-     * 文件只有几百字节，留在内存里最简单；改名回去的方案会在盘上留一类
-     * "看不见但还在占地方"的文件 —— 万一进程被杀，那些文件就永远留在那儿了。
+     * 为什么这个状态放在**这一屏**、而不是浮窗里：导出是挂起的写盘
+     * （`DownloadExport` 里 `withContext(Dispatchers.IO)`），它挂在**这一屏**的
+     * `scope` 上 —— 挂在浮窗上的话，用户导出途中顺手点一下 ×（浮窗退出组合、
+     * 它的 `rememberCoroutineScope` 被取消）就可能留下一条 `IS_PENDING = 1` 的半截记录。
+     * 它同时喂给 `NameDialog` 让那颗键渐暗、点不动（防止连点插两行）。
      */
-    var deleted by remember { mutableStateOf<List<Pair<FunctionFileStore.Entry, String>>>(emptyList()) }
+    var exporting by remember { mutableStateOf(false) }
 
-    /**
-     * 最后删掉的那一批（**只给撤销条显示用**）。
-     *
-     * 为什么不能直接读 [deleted]：撤销条退出动画播的时候 `deleted` 已经是空表了，
-     * 直接读它会闪一句"已删除 0 个"。所以单独留一份"最后一次非空的批次"。
-     */
-    var lastBatch by remember {
-        mutableStateOf<List<Pair<FunctionFileStore.Entry, String>>>(emptyList())
-    }
-    LaunchedEffect(deleted) {
-        if (deleted.isNotEmpty()) lastBatch = deleted
-    }
+    // 这里原来有 `deleted`（刚才删掉的那批文件 + 内容，为了撤销）和 `lastBatch`
+    // （给撤销条显示用）。用户要求删掉所有撤销提示 → 撤销这条路整个不存在了，
+    // 于是也**不再把文件内容读进内存**（那一次 `FunctionFileStore.read` 唯一的用处就是撤销）。
+    // 删除的过渡（`dying`）与它无关，见下面的 [deleteSelected]。
 
     // 入场只播一次（状态留在屏幕这一层：行会被 LazyColumn 回收重建，
     // 放在行里的话每次滚回来都会重播 —— 和 FunctionList 踩过同一个坑）。
@@ -404,13 +429,9 @@ fun SavesScreen(
     var dying by remember { mutableStateOf<Set<String>>(emptySet()) }
     val scope = rememberCoroutineScope()
 
-    // 撤销条 4 秒后自己消失
-    LaunchedEffect(deleted) {
-        if (deleted.isNotEmpty()) {
-            delay(UNDO_MS)
-            deleted = emptyList()
-        }
-    }
+    // 这里原来有一条"撤销条 2 秒后自己消失"的计时（`LaunchedEffect(deleted)`）。
+    // 撤销条删掉之后它没有任何消费者，一并删掉 —— 顺带也不会再出现
+    // "计时器到点把 `deleted` 清空、撤销条闪一下"这类时序问题。
 
     // 表冠 / 滚轮：在这一屏只用来滚动列表（缩放图像是图像界面的事）
     LaunchedEffect(rotary) {
@@ -440,18 +461,18 @@ fun SavesScreen(
     fun deleteSelected() {
         val targets = entries.filter { it.file.absolutePath in selected }
         if (targets.isEmpty()) return
-        // 先把内容读出来（撤销要用），**再**删 —— 删完就读不到了
-        val backups = targets.mapNotNull { e -> FunctionFileStore.read(e.file)?.let { e to it } }
+        // 这里原来先 `FunctionFileStore.read` 把内容读出来留着撤销用 —— 撤销没了，
+        // 这次读盘也一起去掉（少一遍同步 IO）。
         var removed = 0
         for (e in targets) {
             if (FunctionFileStore.delete(e.file)) removed++
         }
-        deleted = backups
         exitMultiSelect()
         // ---- 删除的过渡（用户要求"删除要有过渡"）----
-        // 顺序很讲究：托盘提示和撤销条**立刻**出来（用户马上知道成功了），
+        // 顺序很讲究：托盘提示**立刻**出来（用户马上知道成功了），
         // 而列表里那几行先自己淡出/缩小 [ROW_OUT_MS]，**播完才**真的重读目录 ——
         // 直接 `refresh()` 的话行是"凭空消失"的，没有"我把它删掉了"的手感。
+        // ⚠️ 这一段（`dying` + 延时 + `refresh`）**和撤销无关**，撤销条删掉之后一个字没动。
         dying = targets.map { it.file.absolutePath }.toSet()
         onMessage(
             if (removed == targets.size) {
@@ -779,68 +800,21 @@ fun SavesScreen(
             }
         }
 
-        // ---- 删除后的撤销条（和函数列表那条同一个位置、同一套配色）----
+        // ---- 这里原来是"删除后的撤销条"（0.835 屏高那颗"已删除 N 个 · 点此撤销"胶囊）----
         //
-        // 用户这一轮没要求撤销，但"删用户的文件"这件事值得留一条后路
-        // （垃圾桶线圈只是防误触，不是防后悔）：4 秒内点一下就能整批恢复。
-        AnimatedVisibility(
-            visible = deleted.isNotEmpty(),
-            enter = fadeIn(tween(durationMillis = 180)) +
-                slideInVertically(tween(durationMillis = 220, easing = FastOutSlowInEasing)) {
-                    it / 2
-                },
-            exit = fadeOut(tween(durationMillis = 140)),
-            modifier = Modifier
-                .align(Alignment.TopCenter)
-                .offset(y = metrics.sizeDp * 0.835f)
-                .width(metrics.sizeDp * metrics.circleWidthFraction(0.88f) * 0.9f)
-                .height(metrics.sizeDp * 0.105f)
-        ) {
-            val batch = lastBatch
-            Surface(
-                color = KeyPalette.danger,
-                contentColor = KeyPalette.text,
-                shape = PillShape,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .clickable {
-                        // 撤销 = 把刚才那批文本**原样**写回去（修改时间会变新，
-                        // 于是它们会跑到列表最上面 —— 这正是"刚恢复的东西"该在的位置）
-                        var restored = 0
-                        for ((entry, text) in batch) {
-                            if (FunctionFileStore.write(context, entry.baseName, text) != null) restored++
-                        }
-                        deleted = emptyList()
-                        // 万一用户在"行的淡出动画"还没播完就点了撤销：把 [dying] 一起清掉，
-                        // 否则刚恢复回来的那几行会因为还在 dying 里而**看不见**
-                        dying = emptySet()
-                        refresh()
-                        onMessage(
-                            if (restored == batch.size) {
-                                "已恢复 $restored 个文件"
-                            } else {
-                                "只恢复了 $restored/${batch.size} 个文件"
-                            }
-                        )
-                    }
-            ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Text(
-                        text = "已删除 ${batch.size} 个 · 点此撤销",
-                        fontSize = metrics.fontTiny,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-            }
-        }
+        // 用户这一轮要求"把所有撤销的 toast 提示都给删掉" —— 这颗胶囊就是一条带撤销的提示，
+        // 所以**整颗删掉**（连同 `deleted` / `lastBatch` / `UNDO_MS` 与其过期计时）。
+        // 留下的是删除时那一条**纯提示** toast（`onMessage("已删除 N 个文件")`，见 [deleteSelected]），
+        // 那一条不带任何操作、也不会被点。
 
         // ---- 重命名对话框：**和"保存函数文件"是同一个浮窗**（`NameDialog`）----
         //
         // 原来这一屏自己有一个私有 `RenameDialog`，是 `NameDialog` 的复制品（注释里也写着
         // "数值也一样"）。用户这一轮要求两个浮窗"居中、按钮在输入框下面、图标是 × 和 ✓、
         // 有动画"，两边各改一遍必然会漂 —— 所以直接把复制品删掉，两个入口共用一个实现。
-        // `NameDialog` 的签名**一个字没改**，`GraphScreen.kt` 那边的调用点不用动。
+        // `NameDialog` 的签名只加了**两个可选参数**（`onExport` / `exporting`，都是默认值）：
+        // 不传 `onExport` 时那颗"导出文件"键**根本不进组合** ——
+        // 所以 `GraphScreen.kt` 那边"保存函数文件？"的调用点一个字都不用改、观感不变。
         val target = renameFor
         if (target != null) {
             NameDialog(
@@ -858,6 +832,37 @@ fun SavesScreen(
                 initialName = target.baseName,
                 hint = "输入文件名",
                 errorText = renameError,
+                // 正在导出 → 那颗键渐暗并点不动（连点会往 MediaStore 插两行）
+                exporting = exporting,
+                // ---- 用户要的那颗「导出文件」（**只有这一屏传它**）----
+                //
+                // 用户原话："再给文件列表里面的重命名浮窗里面再加个导出文件的按钮，点击之后
+                // 会在下载文件夹里面的 DrawFunc 文件夹里面导出这个文件，如果没有 DrawFunc
+                // 文件夹自动创建。"
+                //
+                // 三段链路：这一屏（谁在改名 / toast）→ `DownloadExport`（MediaStore，IO 线程）
+                // → `FileExport`（纯规则：名字 / 撞名 / 失败文案，离线有测试）。
+                // 名字用**输入框里此刻的文本**（用户可能刚改完还没按 ✓），空则退原名、非法则拒绝。
+                onExport = { draft ->
+                    if (!exporting) {
+                        exporting = true
+                        // 挂在**这一屏**的 scope 上：浮窗马上被关掉也不打断这次写盘（见 [exporting]）
+                        scope.launch {
+                            val outcome = DownloadExport.export(
+                                context = context,
+                                // 源文件是**只读**的：导出是"复制一份出去"，
+                                // App 自己的存档（`filesDir/saves`）一个字都不动
+                                source = target.file,
+                                draftName = draft,
+                                originalBaseName = target.baseName
+                            )
+                            exporting = false
+                            // 成功失败都给一句话（手表上没有别的反馈渠道），
+                            // 而且**不关浮窗** —— 用户可能还要接着改名、或者再导一次
+                            onMessage(outcome.message)
+                        }
+                    }
+                },
                 onCancel = {
                     renameFor = null
                     renameError = null
@@ -1041,6 +1046,14 @@ private fun FileRow(
     // 上一次点击的时间戳（0 = 没有待配对的点击）。用 longArray 而不是 mutableStateOf：
     // 它只是手势内部的一个记事本，不需要驱动重组。
     val lastTapAt = remember(entry.file.absolutePath) { longArrayOf(0L) }
+    // ---- 长按（进多选）的"有没有出界"观察者（本轮新增，用户全局性要求）----
+    //
+    // 用户原话："**把所有按钮的长按判定都改成只有在按钮的矩形框内才判定。**"
+    // 这一行的长按走 `detectTapGestures(onLongPress=…)`：AndroidX 本身会在出界时取消，
+    // 但它的边界是"节点矩形 + 系统最小触控目标补白"——这一行只有 0.115 × 短边 ≈ 26.8dp 高，
+    // 补白上下各 ≈10.6dp（行与行之间只隔 ≈2.3dp），等于"手指飘到隔壁行上，这一次长按还算数"。
+    // 所以这里挂一个**零消费**的观察者，把边界收紧到"这一行自己的矩形 + 极小容差"。
+    val longPressGuard = rememberPressInsideGuard(entry.file.absolutePath)
 
     // 选中态：底色在"普通键深灰"和"强调色"之间**渐变**（160ms，和功能界面选中 chip
     // 同一个节奏）。直接换色是"啪"地一下，圆表上特别扎眼 —— 用户要求"多选切换也要有过渡"。
@@ -1097,10 +1110,15 @@ private fun FileRow(
                     onLongPress = {
                         // 长按之后 detectTapGestures 不会再补一次 onTap，所以不会重复触发
                         lastTapAt[0] = 0L
-                        onLongPress()
+                        // ⚠️ 本轮新增：手指在按住期间离开过这一行 → 这一次长按作废
+                        // （不切多选）。判据与容差见 `PlotMetrics.pressInsideRect`。
+                        if (longPressGuard.stayedInside) onLongPress()
                     }
                 )
             }
+            // 观察者：只记"手指有没有离开过这一行"，**一个字节都不消费**
+            //（所以单击 / 双击重命名 / 多选切换全都不受影响）
+            .pressInsideGuard(longPressGuard)
     ) {
         Row(
             modifier = Modifier

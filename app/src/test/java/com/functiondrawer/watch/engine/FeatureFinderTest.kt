@@ -9,6 +9,8 @@ import org.junit.Test
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.sqrt
+import kotlin.math.tan
 
 /**
  * FeatureFinder 的单元测试。
@@ -232,5 +234,226 @@ class FeatureFinderTest {
         val nan = FeatureFinder.analyze(f("sqrt(0-1) + x"), -5.0, 5.0)
         assertTrue("处处无定义时零点为空", nan.roots.isEmpty())
         assertTrue("处处无定义时极值为空", nan.extrema.isEmpty())
+    }
+
+    // ------------------------------------------------------------ 相切零点（偶数重根）
+
+    /**
+     * 用户报的 bug：手表上给 `y = x^2` 打开信息卡显示"零点：无"。
+     *
+     * x^2 在 0 处是二重根（曲线**贴着** x 轴不穿过去），所以"相邻采样变号 + 二分"
+     * 这种算法天生看不见它。现在由"|f| 谷底 + 相切判据"这条路负责。
+     */
+    @Test
+    fun x_squared_has_tangent_root_at_zero() {
+        val r = FeatureFinder.analyze(f("x^2"), -10.0, 10.0)
+        assertWellFormed(r, -10.0, 10.0)
+
+        assertEquals("x^2 去重后只有一个零点，实际 ${r.roots}", 1, r.roots.size)
+        assertTrue("x^2 的零点应该在 0 附近，实际 ${r.roots[0]}", abs(r.roots[0]) < 1e-9)
+
+        // 相切零点同时是极值点：两者都要在（这正是 GeoGebra 的行为）
+        val e = r.extrema.firstOrNull { abs(it.x) < 1e-9 }
+        assertNotNull("x^2 的顶点 (0,0) 应该在，实际 ${r.extrema}", e)
+        assertFalse("x^2 的顶点是极小值", e!!.isMax)
+        assertTrue("顶点 y 应该是 0，实际 ${e.y}", abs(e.y) < 1e-12)
+        assertFalse("x^2 处处连续", r.hasDiscontinuity)
+    }
+
+    /**
+     * 上面那条 bug 的**回归测试**：把视口平移 0.003，使 x = 0 不再落在采样网格上。
+     *
+     * 这是第一版真正翻车的场景 —— x=0 不是采样点时，网格上最小的 |f| 是 (step/2)^2 ≈ 6e-6，
+     * 远大于当时的绝对阈值 1e-9，于是"零点：无"。
+     */
+    @Test
+    fun x_squared_root_survives_shifted_grid() {
+        val r = FeatureFinder.analyze(f("x^2"), -10.003, 9.997)
+        assertWellFormed(r, -10.003, 9.997)
+
+        assertTrue("网格错开时 x^2 仍然必须有零点，实际 ${r.roots}", r.roots.isNotEmpty())
+        assertEquals("去重后仍然只有一个零点，实际 ${r.roots}", 1, r.roots.size)
+        assertTrue(
+            "零点应被压到机器精度（要求 < 1e-6），实际 ${r.roots[0]}",
+            abs(r.roots[0]) < 1e-6
+        )
+    }
+
+    @Test
+    fun double_root_and_simple_root_of_cubic() {
+        // (x-1)^2 (x+2)：x=1 是二重根（相切）、x=-2 是单根（穿过）。
+        // 去重后的 roots 是"不同的 x"，所以这里期望两个条目；
+        // 按重数算是三个根 —— 关键是 x=1 这个二重根**必须**在。
+        val r = FeatureFinder.analyze(f("(x-1)^2(x+2)"), -10.0, 10.0)
+        assertWellFormed(r, -10.0, 10.0)
+
+        assertEquals("去重后两个不同的根，实际 ${r.roots}", 2, r.roots.size)
+        assertTrue("单根 -2 应在，实际 ${r.roots}", abs(r.roots[0] + 2.0) < 1e-9)
+        assertTrue("二重根 1 应在，实际 ${r.roots}", abs(r.roots[1] - 1.0) < 1e-9)
+
+        val e = r.extrema.firstOrNull { abs(it.x - 1.0) < 1e-6 }
+        assertNotNull("二重根处同时是极小值，实际 ${r.extrema}", e)
+        assertFalse("x=1 处是极小值", e!!.isMax)
+    }
+
+    /** sin 的根间距 π ≈ 3.14，是"精度够不够"最直观的硬指标：这里要求 1e-12。 */
+    @Test
+    fun sin_roots_are_accurate_to_machine_precision() {
+        val r = FeatureFinder.analyze(f("sin(x)"), -10.0, 10.0)
+        assertWellFormed(r, -10.0, 10.0)
+
+        val expected = listOf(-3 * PI, -2 * PI, -PI, 0.0, PI)
+        assertEquals("默认 limit 下保留 x 最小的 5 个根，实际 ${r.roots}", 5, r.roots.size)
+        for ((k, want) in expected.withIndex()) {
+            assertTrue(
+                "第 ${k + 1} 个零点应≈ $want，实际 ${r.roots[k]}（误差 ${abs(r.roots[k] - want)}）",
+                abs(r.roots[k] - want) < 1e-12
+            )
+        }
+    }
+
+    /** sin^2 在 [-4,4] 上有三个相切零点（±π 与 0），全都是偶数重根。 */
+    @Test
+    fun sin_squared_tangent_roots() {
+        val r = FeatureFinder.analyze(f("sin(x)^2"), -4.0, 4.0)
+        assertWellFormed(r, -4.0, 4.0)
+
+        assertEquals("sin^2 在 [-4,4] 上三个相切零点，实际 ${r.roots}", 3, r.roots.size)
+        for ((k, want) in listOf(-PI, 0.0, PI).withIndex()) {
+            assertTrue(
+                "第 ${k + 1} 个零点应≈ $want，实际 ${r.roots[k]}",
+                abs(r.roots[k] - want) < 1e-9
+            )
+        }
+    }
+
+    // ------------------------------------------------------------ 渐近线不许报假特征
+
+    @Test
+    fun tan_has_no_fake_roots_at_poles() {
+        val r = FeatureFinder.analyze(f("tan(x)"), -4.0, 4.0)
+        assertWellFormed(r, -4.0, 4.0)
+
+        val nearPole = r.roots.filter { abs(abs(it) - PI / 2) < 0.05 }
+        assertTrue("±π/2 附近绝不能有零点，实际 $nearPole（全部：${r.roots}）", nearPole.isEmpty())
+        // 每个报出来的根都真的让 tan 落在 0 上（±π 处 tan 的浮点值是 ~1e-16）
+        for (x in r.roots) {
+            assertTrue("报出的零点 $x 处 tan = ${tan(x)}，不是根", abs(tan(x)) < 1e-9)
+        }
+        assertTrue("tan 在 ±π/2 无定义，应标记不连续", r.hasDiscontinuity)
+    }
+
+    @Test
+    fun reciprocal_pole_is_not_a_root_or_extremum() {
+        val r = FeatureFinder.analyze(f("1/x"), -2.0, 2.0)
+        assertWellFormed(r, -2.0, 2.0)
+
+        assertTrue("1/x 没有零点，实际 ${r.roots}", r.roots.isEmpty())
+        assertTrue("1/x 没有极值点（0 处是极点），实际 ${r.extrema}", r.extrema.isEmpty())
+        assertTrue("1/x 在 0 处无定义，应标记不连续", r.hasDiscontinuity)
+    }
+
+    // ------------------------------------------------------------ 不许把"贴着但没碰到"报成零点
+
+    @Test
+    fun functions_that_never_reach_zero_have_no_roots() {
+        // (x-0.5)^2 + 0.01：谷底离 0 有 0.01
+        // x^2 + 1e-9：谷底离 0 只有 1e-9，但仍然是正的 —— 相对判据必须挡住它
+        // x^2 + 1、常数 2：显而易见
+        for (src in listOf("(x-0.5)^2+0.01", "x^2+1e-9", "x^2+1", "2")) {
+            val r = FeatureFinder.analyze(f(src), -10.0, 10.0)
+            assertWellFormed(r, -10.0, 10.0)
+            assertTrue("$src 不应该有任何零点，实际 ${r.roots}", r.roots.isEmpty())
+        }
+    }
+
+    /**
+     * 整体尺度很小的函数：`1e-12·x^2`。
+     *
+     * 第一版用绝对阈值 1e-9 判零，于是 `|f| <= 1e-9 ⟺ |x| <= 31.6`，
+     * 在 [-10,10] 上**整条曲线**都算 0 → 报出 5 个散布全区的假零点。
+     * 现在判据全部相对函数自身量级，只有一个真零点。
+     */
+    @Test
+    fun tiny_scaled_function_reports_exactly_one_root() {
+        val r = FeatureFinder.analyze(f("1e-12*x^2"), -10.0, 10.0)
+        assertWellFormed(r, -10.0, 10.0)
+
+        assertEquals("1e-12·x^2 只有一个零点，实际 ${r.roots}", 1, r.roots.size)
+        assertTrue("零点在 0 附近，实际 ${r.roots[0]}", abs(r.roots[0]) < 1e-6)
+    }
+
+    // ------------------------------------------------------------ 三次函数的根与极值
+
+    @Test
+    fun cubic_roots_and_extrema() {
+        val r = FeatureFinder.analyze(f("x^3-3x"), -10.0, 10.0)
+        assertWellFormed(r, -10.0, 10.0)
+
+        val s3 = sqrt(3.0)
+        assertEquals("x^3-3x 三个零点，实际 ${r.roots}", 3, r.roots.size)
+        assertTrue("-√3 应在，实际 ${r.roots[0]}", abs(r.roots[0] + s3) < 1e-9)
+        assertTrue("0 应在，实际 ${r.roots[1]}", abs(r.roots[1]) < 1e-9)
+        assertTrue("√3 应在，实际 ${r.roots[2]}", abs(r.roots[2] - s3) < 1e-9)
+
+        assertEquals("x^3-3x 两个极值点，实际 ${r.extrema}", 2, r.extrema.size)
+        val lo = r.extrema[0]
+        assertTrue("极小/极大 x = -1，实际 ${lo.x}", abs(lo.x + 1.0) < 1e-9)
+        assertTrue("x=-1 处是极大值（y=2），实际 y=${lo.y}", lo.isMax && abs(lo.y - 2.0) < 1e-9)
+        val hi = r.extrema[1]
+        assertTrue("极值 x = 1，实际 ${hi.x}", abs(hi.x - 1.0) < 1e-9)
+        assertFalse("x=1 处是极小值", hi.isMax)
+        assertTrue("x=1 处 y=-2，实际 y=${hi.y}", abs(hi.y + 2.0) < 1e-9)
+    }
+
+    // ------------------------------------------------------------ 去重阈值
+
+    /**
+     * `x^2 - 9e-10` 的两个根相距只有 6e-5。
+     *
+     * 第一版的去重阈值是"范围的 1e-6"：范围 60 时等于 6e-5，正好会把这一对真实根
+     * 并成一个。现在的阈值与可达精度相称（相对 1e-9），这一对必须原样保留。
+     *
+     * 注意这里的可分辨性还依赖"采样网格里有点落进 x²-9e-10 的负谷"（本用例里 0 是网格点）：
+     * 谷底比采样步长还窄、又没有任何采样点落进去时，只能靠 |f| 谷底路径找到其中一个 —— 见报告里
+     * 的"剩余不确定项"。这一条测的是**去重阈值**，不是网格分辨率。
+     */
+    @Test
+    fun two_roots_six_microunits_apart_are_not_merged() {
+        val r = FeatureFinder.analyze(f("x^2-9e-10"), -30.0, 30.0)
+        assertWellFormed(r, -30.0, 30.0)
+
+        assertEquals("±3e-5 是两个不同的根，实际 ${r.roots}", 2, r.roots.size)
+        assertTrue("负根应≈ -3e-5，实际 ${r.roots[0]}", abs(r.roots[0] + 3e-5) < 1e-9)
+        assertTrue("正根应≈ 3e-5，实际 ${r.roots[1]}", abs(r.roots[1] - 3e-5) < 1e-9)
+    }
+
+    // ------------------------------------------------------------ 退化输入
+
+    @Test
+    fun degenerate_inputs_return_empty_without_throwing() {
+        val g = f("x^2")
+
+        for (pair in listOf(
+            Double.NaN to 1.0,
+            -1.0 to Double.NaN,
+            Double.NEGATIVE_INFINITY to 1.0,
+            -1.0 to Double.POSITIVE_INFINITY,
+            5.0 to -5.0,
+            1.0 to 1.0
+        )) {
+            val r = FeatureFinder.analyze(g, pair.first, pair.second)
+            assertTrue("范围 (${pair.first}, ${pair.second}) 下零点应为空，实际 ${r.roots}", r.roots.isEmpty())
+            assertTrue("范围 (${pair.first}, ${pair.second}) 下极值应为空", r.extrema.isEmpty())
+            assertNull("非法范围下 y 截距应为 null", r.yIntercept)
+        }
+
+        val zeroLimit = FeatureFinder.analyze(g, -1.0, 1.0, limit = 0)
+        assertTrue("limit = 0 时零点为空", zeroLimit.roots.isEmpty())
+        assertTrue("limit = 0 时极值为空", zeroLimit.extrema.isEmpty())
+
+        val negativeLimit = FeatureFinder.analyze(g, -1.0, 1.0, limit = -3)
+        assertTrue("负 limit 时零点为空", negativeLimit.roots.isEmpty())
+        assertTrue("负 limit 时极值为空", negativeLimit.extrema.isEmpty())
     }
 }

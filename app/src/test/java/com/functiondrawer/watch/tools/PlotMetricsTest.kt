@@ -10,12 +10,22 @@ import com.functiondrawer.watch.ui.LABEL_SHIFT_QUANTUM_FRACTION
 import com.functiondrawer.watch.ui.LABEL_SNAP_SLACK_FRACTION
 import com.functiondrawer.watch.ui.MIN_GRID_PX
 import com.functiondrawer.watch.ui.MIN_LABEL_SPACING_FRACTION
+import com.functiondrawer.watch.ui.PRESS_INSIDE_SLACK_FRACTION
 import com.functiondrawer.watch.ui.SLIDER_PARAM_COL_W
 import com.functiondrawer.watch.ui.SLIDER_ROW_GAP
 import com.functiondrawer.watch.ui.SLIDER_ROW_PAD
 import com.functiondrawer.watch.ui.SWIPE_DELETE_TINT
 import com.functiondrawer.watch.ui.SWIPE_DELETE_TRAVEL
+import com.functiondrawer.watch.ui.SettingsFields
+import com.functiondrawer.watch.ui.SwipeDeleteMotion
+import com.functiondrawer.watch.ui.TOOLBAR_MENU_END_KEY_ALPHA
+import com.functiondrawer.watch.ui.TOOLBAR_MENU_END_KEY_SCALE
+import com.functiondrawer.watch.ui.TOOLBAR_MENU_GAP
+import com.functiondrawer.watch.ui.TOOLBAR_MENU_PANEL_SCALE_X_FROM
+import com.functiondrawer.watch.ui.TOOLBAR_MENU_PANEL_SCALE_Y_FROM
+import com.functiondrawer.watch.ui.ToolbarKeySide
 import com.functiondrawer.watch.ui.WATCH_BASE_PX
+import com.functiondrawer.watch.ui.archiveHasContent
 import com.functiondrawer.watch.ui.gridStepForScreen
 import com.functiondrawer.watch.ui.gridTargetPxFor
 import com.functiondrawer.watch.ui.labelCornerAnchorPx
@@ -30,6 +40,7 @@ import com.functiondrawer.watch.ui.oneWayDragLostToOtherAxis
 import com.functiondrawer.watch.ui.oneWayDragStep
 import com.functiondrawer.watch.ui.pinLabelIntoBand
 import com.functiondrawer.watch.ui.pinLabelNearAxis
+import com.functiondrawer.watch.ui.pressInsideRect
 import com.functiondrawer.watch.ui.quantizeShiftUpPx
 import com.functiondrawer.watch.ui.sliderPlayKeyLeftDp
 import com.functiondrawer.watch.ui.sliderPlayKeyRightDp
@@ -40,6 +51,18 @@ import com.functiondrawer.watch.ui.swipeDeleteProgress
 import com.functiondrawer.watch.ui.swipeDeleteReached
 import com.functiondrawer.watch.ui.swipeDeleteSweepAlpha
 import com.functiondrawer.watch.ui.swipeDeleteSweepScale
+import com.functiondrawer.watch.ui.toolbarKeyAt
+import com.functiondrawer.watch.ui.toolbarKeyCenterDistancePx
+import com.functiondrawer.watch.ui.toolbarKeyGapPx
+import com.functiondrawer.watch.ui.toolbarMenuCrossedToOtherKey
+import com.functiondrawer.watch.ui.toolbarMenuEndKeyAlpha
+import com.functiondrawer.watch.ui.toolbarMenuEndKeyScale
+import com.functiondrawer.watch.ui.toolbarMenuEndKeyShiftPx
+import com.functiondrawer.watch.ui.toolbarMenuHandleAlpha
+import com.functiondrawer.watch.ui.toolbarMenuPanelAlpha
+import com.functiondrawer.watch.ui.toolbarMenuPanelScaleX
+import com.functiondrawer.watch.ui.toolbarMenuPanelScaleY
+import com.functiondrawer.watch.ui.toolbarStripRect
 import com.functiondrawer.watch.ui.xRowRangeFromCorner
 import com.functiondrawer.watch.ui.yColumnRangeFromCorner
 import com.functiondrawer.watch.ui.swipeDeleteSweepShiftPx
@@ -86,6 +109,17 @@ import kotlin.math.sqrt
  * **运行期**的事（谁消费了 down，见 `PlotMetrics` 末尾那一节），但"播放键那一格在哪"
  * 和三块屏上"删除起手区到底多宽"是纯算术 —— 太窄点不中、太宽就会吃掉滑轨的地盘，
  * 所以它必须离线钉住。
+ *
+ * 本轮又加了第三类（五、六、七三组）：
+ *   * **五**：左滑删除的**跟手位移状态机**（`SwipeDeleteMotion`）—— 用户报的
+ *     "删掉之后还会从中间再往左滑动"就是"抬手之后位移被清零"造成的，而"什么时候
+ *     该清零"是纯状态机的算术，属于必须离线钉住的那一半；
+ *   * **六**：工具条上"横着滑一下唤出撤销/重做"的**尺度与展开动画**
+ *     （`PlotMetrics` 第五节）—— 滑多长才算唤出、两端的键让开多少、菜单怎么长出来，
+ *     全是比例算术，装到表上试一次的代价太大；
+ *   * **七**：本地存档里那一行**设置**的编解码（`SettingsFields`）—— 用户报的
+ *     "设置没有被记住"有一半出在这条链上（字段顺序 / 缺段补齐 / 空函数列表），
+ *     而 `Store.kt` 带 Android 依赖、离线编不了，所以顺序与规矩必须住在这一层被钉住。
  */
 class PlotMetricsTest {
 
@@ -1681,5 +1715,594 @@ class PlotMetricsTest {
         assertEquals(0f, sliderPlayKeyLeftDp(0f), 0f)
         assertEquals(sliderPlayKeyLeftDp(size), sliderPlayKeyRightDp(size, Float.NaN), 1e-4f)
         assertEquals(sliderPlayKeyLeftDp(size), sliderPlayKeyRightDp(size, 0f), 1e-4f)
+    }
+
+    // ---- 五、甩出动画的**起点**（本轮修的第二个删除动画 bug） ----
+    //
+    // 用户原话："函数列表删除的动画有点抽搐，把一个对象从右往左滑删除之后还会从中间
+    // 再往左滑动，实际应该是从松手的位置就继续滑动，而不是从中间再滑动。"
+    //
+    // 上一轮修的是**方向**（合成位移 = 跟手 + 甩出），这一轮是**起点**：真因在
+    // `awaitEachGesture` 的循环形状上 —— 抬手之后它会把循环体**立刻再跑一遍**
+    // （1.7 的字节码：`while (isActive) { block(); awaitAllPointersUp() }`，
+    // 而 `awaitAllPointersUp` 在"最后一个事件已经是抬手"时立即返回），
+    // 而循环体第一句原来是无条件的 `dragX = 0f`。于是：
+    //   ① `onEnd` 里 `scope.launch { 甩出动画 }` 只是**排队**（下一帧才跑）；
+    //   ② 同一个调度里 `dragX = 0f` 先执行了；
+    //   ③ 动画第一帧算出来的就是 `0 + 甩出` —— 行先回到原位（用户眼里的"中间"），
+    //      再从那里往左滑。
+    // 下面两条测试把"清零只许发生在**没进入甩出**的那一串"钉在纯状态机上
+    // （`SwipeDeleteMotion`，真机上 `RowSwipeDelete` 就是它的镜像）。
+
+    /** 甩出动画的起点与单调性（给定"松手位移 = 行宽的 -1/3"）。 */
+    @Test
+    fun `甩出动画必须从松手位置开始：抬手之后那一次"新一串手势"不许把位移清零`() {
+        // 三块屏的行宽都过一遍（函数行 / 几何对象行 / 滑动条行**共用**这个状态机，
+        // 所以这一条对三行同时成立）：圆表最宽行、圆表最窄行、手机满宽。
+        for (w in rowWidthsPx) {
+            val travel = swipeDeleteTravelPx(w)
+            val motion = SwipeDeleteMotion()
+
+            // ① 一串真实手势：按下 → 跟手（中途回搓一下再滑够）→ 停在"行宽的 -1/3"
+            motion.beginGesture()
+            assertEquals("新一串手势从 0 开始（这是该清零的那一次）", 0f, motion.followPx, 1e-4f)
+            motion.drag(-travel * 0.4f)
+            motion.drag(-travel * 0.2f)
+            motion.drag(-travel * 1.2f)
+            val releaseAt = -travel               // 松手位置 = 行宽的 -1/3
+            motion.drag(releaseAt)
+            assertEquals("跟手位移就是手指滑到的地方", releaseAt, motion.followPx, 1e-3f)
+            assertEquals(
+                "甩出还没开始（sweep = 0）时，行就停在松手位置",
+                releaseAt,
+                motion.translationPx(w, 0f),
+                1e-3f
+            )
+
+            // ② 抬手：够远 → 进入"被扔掉"阶段（`sweeping` 立起来）
+            assertTrue("行宽 ${w}px：滑够 1/3 必须判删", motion.release(releaseAt, w))
+            assertTrue("够远之后必须进入甩出阶段", motion.sweeping)
+
+            // ③ ⚠️ 真机上在这里 `awaitEachGesture` 会**立刻**把循环体再跑一遍，
+            //    也就是再调一次 `beginGesture()`。上一版那一句是无条件的 `dragX = 0f`，
+            //    于是甩出动画的第一帧是 0（= 行原来的位置）。
+            motion.beginGesture()
+            assertEquals(
+                "抬手之后的那一次 beginGesture 绝不能清零 —— 它正是「从中间再往左滑」的真因",
+                releaseAt,
+                motion.followPx,
+                1e-3f
+            )
+            assertEquals(
+                "甩出动画的**起点**必须等于松手位置",
+                releaseAt,
+                motion.translationPx(w, 0f),
+                1e-3f
+            )
+
+            // ④ 全程**单调往左**：任何一帧都不许比上一帧更靠右
+            var previous = motion.translationPx(w, 0f)
+            for (i in 1..50) {
+                val now = motion.translationPx(w, i / 50f)
+                assertTrue(
+                    "行宽 ${w}px 第 $i 帧：甩出必须一路往左，$previous → $now",
+                    now <= previous + 1e-4f
+                )
+                assertTrue(
+                    "行宽 ${w}px 第 $i 帧：任何一帧都不许跑到松手位置右边",
+                    now <= releaseAt + 1e-4f
+                )
+                previous = now
+            }
+            // ⑤ 终点 = 松手位置 + （−0.28 行宽）：两个往左的量相加
+            assertEquals(releaseAt - w * DELETE_OUT_SHIFT, previous, 1e-2f)
+
+            // ⑥ 甩出阶段**不许被复活**：又滑一下也改不了位移（这一行马上就会被删掉）
+            motion.drag(-w)
+            assertEquals("甩出阶段的位移是冻结的", releaseAt, motion.followPx, 1e-3f)
+            assertFalse("同一串手势不许触发第二次删除", motion.release(-w, w))
+        }
+
+        // ⑦ 反面：把位移清零之后的第一帧就是 0 —— 那正是用户看到的"回到中间"。
+        //    这条把"为什么用户看到的是那样"钉在算术上（上一版的写法）。
+        val reset = SwipeDeleteMotion()
+        reset.beginGesture()                       // ← 上一版：每次进循环体都无条件清零
+        assertEquals(
+            "清零之后第一帧就是原点（屏幕上就是行回到了它原来的位置）",
+            0f,
+            reset.translationPx(419f, 0f),
+            1e-4f
+        )
+    }
+
+    /** 不够远的左滑：**该**清零的那条路径，行弹回原位、绝不进甩出。 */
+    @Test
+    fun `不够远的左滑仍然弹回原位：清零只发生在没进入甩出的那一串`() {
+        val w = 419f
+        val travel = swipeDeleteTravelPx(w)
+        val motion = SwipeDeleteMotion()
+        motion.beginGesture()
+        // 差 1px 不够：抬手 → 不删、位移归零
+        motion.drag(-travel + 1f)
+        assertFalse(motion.release(-travel + 1f, w))
+        assertFalse("没够远就不该进入甩出阶段", motion.sweeping)
+        assertEquals("不够远 → 行弹回原位", 0f, motion.followPx, 1e-4f)
+        // 之后新的一串手势照样从 0 开始（那是**该**清零的那种情况）
+        motion.beginGesture()
+        assertEquals(0f, motion.followPx, 1e-4f)
+        assertEquals(0f, motion.translationPx(w, 0f), 1e-4f)
+        // 往右拖：跟手位移被夹成 0、也不删（往右是第一屏"左边缘右滑"的方向）
+        motion.drag(w)
+        assertEquals(0f, motion.followPx, 1e-4f)
+        assertFalse(motion.release(w, w))
+        // 行宽非法（还没被测到）：怎么滑都不算够 → 弹回原位、绝不进甩出
+        motion.drag(-1000f)
+        assertFalse(motion.release(-1000f, 0f))
+        assertFalse(motion.sweeping)
+        assertEquals(0f, motion.followPx, 1e-4f)
+        // 非法位移（NaN）：`swipeDeleteFollow` 把它夹成 0，也绝不把 NaN 算进位移里
+        motion.drag(-travel)
+        motion.drag(Float.NaN)
+        assertTrue("位移必须是有限数（NaN 进图层 = 整行消失）", motion.followPx.isFinite())
+        assertEquals(0f, motion.followPx, 1e-4f)
+    }
+
+    // ---- 六、工具条上「从一颗键滑到另一颗键」唤出撤销 / 重做（`PlotMetrics` 第五节） ----
+    //
+    // 用户补充（本轮，这条是判据的全部依据）："**按出撤销菜单的条件是从顶部的一个按钮
+    // 滑到另一个按钮，请不要给顶部的按钮还没有滑到另一个按钮的时候就加动画。**"
+    //
+    // 于是判据从"拖了多远"（旧的 0.16 × 短边阈值）改成**几何**：
+    //   ① 落点必须在 左键矩形 `[0, w]` 或 右键矩形 `[行宽 − w, 行宽]` 里；
+    //   ② 手指要**真的进到另一颗键的矩形**里 —— 那蕴含"越过两颗键之间那道空当"；
+    //   ③ 达成之前**不消费任何事件**、也**不报告任何进度**（所以一帧动画都没有）——
+    //      第 ③ 条属于运行期的事，写在 `DragGestures.awaitKeyToKeySwipe` 与 `Common.kt`
+    //      的注释里；能离线钉住的是 ①② 这两条算术，以及三块屏上的实际行程。
+
+    @Test
+    fun `工具条判定用真实几何：起手必须在某颗键上，进另一颗键的矩形才算达成`() {
+        // 三块屏的真实几何（行内坐标，单位 px）：
+        //   行宽 = 圆屏弧宽比例（0.52）/ 非圆屏"屏宽 − 左右各 3%"（`ScreenGeometry.rowWidth`）
+        //   单键宽 w = 0.18 × 短边（`WatchMetrics.iconButton`，形状锁定，见 README）
+        //   | 圆表 233dp d2    | 行宽 121.16dp → 242.32px | w 41.94dp → 83.88px |
+        //   | 方表 200dp d2    | 行宽 104.00dp → 208.00px | w 36.00dp → 72.00px |
+        //   | 手机 411dp d2.75 | 行宽 386.34dp → 1062.44px| w 73.98dp → 203.45px|
+        val screens = listOf(
+            242.32f to 83.88f,
+            208.00f to 72.00f,
+            1062.44f to 203.45f
+        )
+
+        for ((rowW, keyW) in screens) {
+            // ---- ① 两颗键的矩形（判定完全靠这两个区间）----
+            assertEquals(ToolbarKeySide.LEFT, toolbarKeyAt(0f, rowW, keyW))
+            assertEquals(ToolbarKeySide.LEFT, toolbarKeyAt(keyW * 0.5f, rowW, keyW))
+            assertEquals(
+                "左键的右沿算左键（边界上不留一条'擦过去不算'的缝）",
+                ToolbarKeySide.LEFT,
+                toolbarKeyAt(keyW, rowW, keyW)
+            )
+            assertEquals("刚出左键就是空当", ToolbarKeySide.NONE, toolbarKeyAt(keyW + 0.01f, rowW, keyW))
+            assertEquals(
+                "中间那道空当不属于任何一颗键",
+                ToolbarKeySide.NONE,
+                toolbarKeyAt(rowW * 0.5f, rowW, keyW)
+            )
+            assertEquals("右键的左沿算右键", ToolbarKeySide.RIGHT, toolbarKeyAt(rowW - keyW, rowW, keyW))
+            assertEquals(ToolbarKeySide.RIGHT, toolbarKeyAt(rowW, rowW, keyW))
+            // 拖到行外（手指滑出行边界）也按同一把尺子判：左边继续算左键、右边继续算右键
+            assertEquals(ToolbarKeySide.LEFT, toolbarKeyAt(-40f, rowW, keyW))
+            assertEquals(ToolbarKeySide.RIGHT, toolbarKeyAt(rowW + 40f, rowW, keyW))
+
+            // ---- ② 达成判据：起手在 A、此刻进了 B 的矩形 ----
+            assertFalse(
+                "起手落在空当里 → 永远不算（那一段留给'顶部下滑回图像'）",
+                toolbarMenuCrossedToOtherKey(ToolbarKeySide.NONE, keyW * 0.5f, rowW, keyW)
+            )
+            assertFalse("原地不动不算", toolbarMenuCrossedToOtherKey(ToolbarKeySide.LEFT, 0f, rowW, keyW))
+            assertFalse(
+                "还在自己那颗键上不算",
+                toolbarMenuCrossedToOtherKey(ToolbarKeySide.LEFT, keyW, rowW, keyW)
+            )
+            assertFalse(
+                "只走到空当里不算 —— 这就是用户说的'随便横拖一点'",
+                toolbarMenuCrossedToOtherKey(ToolbarKeySide.LEFT, rowW * 0.5f, rowW, keyW)
+            )
+            assertTrue(
+                "进了另一颗键的矩形 → 达成",
+                toolbarMenuCrossedToOtherKey(ToolbarKeySide.LEFT, rowW - keyW, rowW, keyW)
+            )
+            assertTrue(
+                "反方向一样成立（从 + 滑回 ⚙ / 从 🗑 滑回 📁）",
+                toolbarMenuCrossedToOtherKey(ToolbarKeySide.RIGHT, keyW, rowW, keyW)
+            )
+            assertFalse(
+                "从右键再往右拖出屏幕外不算",
+                toolbarMenuCrossedToOtherKey(ToolbarKeySide.RIGHT, rowW + 100f, rowW, keyW)
+            )
+            assertFalse(
+                "从右键往左走到空当里也不算",
+                toolbarMenuCrossedToOtherKey(ToolbarKeySide.RIGHT, rowW * 0.5f, rowW, keyW)
+            )
+
+            // ---- ③ 行程：最短 = 那道空当，典型 = 中心距 ----
+            val gap = toolbarKeyGapPx(rowW, keyW)
+            val center = toolbarKeyCenterDistancePx(rowW, keyW)
+            assertEquals(rowW - keyW * 2f, gap, 1e-3f)
+            assertEquals(rowW - keyW, center, 1e-3f)
+            assertTrue("中心距必须比空当宽（两颗键不许重叠）", center > gap)
+            // 这条是"不需要任何距离阈值常量"的依据：最短行程本身已经是触摸容差的好几倍
+            assertTrue("最短行程 $gap px 必须远大于触摸容差（否则'随手划一下'就成立）", gap >= 48f)
+            // 空当里的**每一个点**都不达成（跨过去才算）
+            var x = keyW
+            while (x < rowW - keyW) {
+                assertFalse(
+                    "空当里 x=$x 不该达成",
+                    toolbarMenuCrossedToOtherKey(ToolbarKeySide.LEFT, x, rowW, keyW)
+                )
+                x += gap / 16f
+            }
+        }
+
+        // ---- ④ 三块屏上的实算值（报告里那张表；改版面比例时这里立刻红）----
+        val round = screens[0]
+        val square = screens[1]
+        val phone = screens[2]
+        // 圆表：最短 37.28dp（74.6px）、典型 79.22dp
+        assertEquals(37.28f, toolbarKeyGapPx(round.first, round.second) / 2f, 0.02f)
+        assertEquals(79.22f, toolbarKeyCenterDistancePx(round.first, round.second) / 2f, 0.02f)
+        // 方表：32.00dp / 68.00dp
+        assertEquals(32.00f, toolbarKeyGapPx(square.first, square.second) / 2f, 0.02f)
+        assertEquals(68.00f, toolbarKeyCenterDistancePx(square.first, square.second) / 2f, 0.02f)
+        // 手机（d2.75）：238.38dp / 312.36dp
+        assertEquals(238.38f, toolbarKeyGapPx(phone.first, phone.second) / 2.75f, 0.05f)
+        assertEquals(312.36f, toolbarKeyCenterDistancePx(phone.first, phone.second) / 2.75f, 0.05f)
+
+        // ---- ⑤ 非法 / 退化输入：一律"不算"，绝不抛异常（这个函数每帧都会被调到）----
+        assertEquals(ToolbarKeySide.NONE, toolbarKeyAt(Float.NaN, 242.32f, 83.88f))
+        assertEquals(ToolbarKeySide.NONE, toolbarKeyAt(50f, Float.NaN, 83.88f))
+        assertEquals(ToolbarKeySide.NONE, toolbarKeyAt(50f, 242.32f, Float.NaN))
+        assertEquals(ToolbarKeySide.NONE, toolbarKeyAt(50f, 0f, 83.88f))
+        assertEquals(ToolbarKeySide.NONE, toolbarKeyAt(50f, 242.32f, 0f))
+        assertEquals(ToolbarKeySide.NONE, toolbarKeyAt(50f, -10f, 83.88f))
+        // 两道键重叠（`2w ≥ 行宽`，只在极端的坏版面上可能出现）：整条都不认 ——
+        // 宁可不触发，也不能把一次点击当成"滑过去"
+        assertEquals(ToolbarKeySide.NONE, toolbarKeyAt(50f, 100f, 60f))
+        assertFalse(toolbarMenuCrossedToOtherKey(ToolbarKeySide.LEFT, 0f, 100f, 60f))
+        assertEquals(0f, toolbarKeyGapPx(100f, 60f), 1e-4f)
+        assertEquals(0f, toolbarKeyCenterDistancePx(Float.NaN, 10f), 1e-4f)
+        assertEquals(0f, toolbarKeyGapPx(Float.NaN, 10f), 1e-4f)
+        assertEquals(0f, toolbarKeyGapPx(10f, Float.NaN), 1e-4f)
+    }
+
+    @Test
+    fun `控件自己的矩形：工具条那一条的禁区全宽，长按出界的边界只在控件内`() {
+        // ===================================================================================
+        // 一、**工具条那一条**（切屏手势的禁区）
+        //
+        // 用户口径（三轮，**以最后一句为准**）：
+        //   * "在能够唤出撤销菜单的按键的位置滑到另一个屏幕的判定应该取消掉。"
+        //   * "在右边缘手势的起手判据里把工具条那一段（屏高 10%~22.5%）排掉。"
+        //   * "**只排掉那一行本身。**"
+        // 所以排掉的是"**整屏宽 × 工具条那一行自己的上下沿**"——
+        // 上沿 = sy(0.10)（占**真实屏高**），下沿 = 上沿 + 0.125 × **短边**（行高）。
+        // 左右沿**整屏宽**（用户第一句点名的是"那一段"），**不是**行自己那个内缩过的矩形。
+        //
+        // 圆表 233dp（d2，短边 = 屏高）：屏宽 466px、行 y = sy(0.10) = 46.60px、
+        // 行高 0.125 × 233dp = 29.125dp = 58.25px ⇒ 下沿 104.85px
+        //   ⇒ 矩形 **x ∈ [0, 466]px（全宽）、y ∈ [46.60, 104.85]px**（= 那一行，逐像素）
+        val round = toolbarStripRect(
+            screenWidthPx = 466f,
+            bandTopPx = 46.60f,
+            bandBottomPx = 104.85f
+        )!!
+        assertEquals("左沿必须是 0（全宽）", 0f, round.left, 1e-4f)
+        assertEquals("右沿必须是整屏宽", 466f, round.right, 1e-4f)
+        assertEquals(46.60f, round.top, 0.02f)
+        assertEquals(104.85f, round.bottom, 0.02f)
+        // 四条边**都算在内**（边界上不留一条"擦过去就切屏"的缝）
+        assertTrue(round.contains(0f, 46.60f))
+        assertTrue(round.contains(466f, 104.85f))
+        assertTrue(round.contains(233f, 75f))               // 屏幕正中（也在工具条行里）
+        assertFalse(round.contains(233f, 46.60f - 0.5f))    // 上沿之上
+        assertFalse(round.contains(233f, 104.85f + 0.5f))   // 下沿之下
+        // **全宽**的两处直接后果：行两侧那两块空白（圆表 x < 55.9dp / x > 177.1dp）
+        // 也在禁区里 —— 这正是用户要的"整条带一刀切"（那两块本来也唤不出菜单，
+        // 封掉它们只是让边缘手势少掉这一截，见 `ToolbarStripRect` 的注释）。
+        assertTrue("行左侧那块空白也在禁区里（全宽）", round.contains(30f, 75f))
+        assertTrue("行右侧那块空白也在禁区里（全宽）", round.contains(440f, 75f))
+        // 两个**真实冲突点**（各自 4.7dp）自然都在里面：
+        assertTrue("第一屏左边缘热区与 ⚙ 左侧的重叠点", round.contains(116f, 75f))
+        assertTrue("第二屏右边缘热区与 🗑 右侧的重叠点", round.contains(350f, 75f))
+        // 反过来：两条热区**在禁区之外**的部分（例如再往下一行的同一个 x）照旧可用
+        assertFalse("左边缘热区在工具条下面那一段照旧可用", round.contains(116f, 130f))
+        assertFalse("右边缘热区在工具条下面那一段照旧可用", round.contains(350f, 130f))
+        // 顶部下滑那条热区（y ≤ 0.20 屏高 = 93.2px）**不带这个禁区**（用户要求"照旧"），
+        // 这里只钉住"这一条带确实压着它的上一半"，禁不禁是调用点的事。
+        assertTrue(round.contains(233f, 60f))
+
+        // 非圆屏（手机 411 × 850dp / d2.75）：屏宽 1130.25px、行顶 sy(0.10) = 85dp = 233.75px、
+        // 行高 0.125 × **短边 411dp** = 51.375dp = 141.28px ⇒ 下沿 **375.03px**
+        //   （上一版按"真实屏高的 22.5%"算成 525.94px —— 比这一行高出 55dp，
+        //     用户点名"只排掉那一行本身"之后收掉了）
+        val phone = toolbarStripRect(
+            screenWidthPx = 1130.25f,
+            bandTopPx = 233.75f,
+            bandBottomPx = 375.03f
+        )!!
+        assertEquals(0f, phone.left, 1e-4f)
+        assertEquals(1130.25f, phone.right, 1e-4f)
+        assertTrue(phone.contains(20f, 300f))              // 行外那 3%（现在也禁了）
+        assertTrue(phone.contains(1100f, 374f))
+        assertFalse("行底之下这一小段现在**不再**被排掉（上一版会被排掉）", phone.contains(565f, 400f))
+        assertFalse(phone.contains(565f, 600f))            // 带子下面
+        // 方表 200dp / d2：行顶 20dp = 40px、行高 25dp = 50px ⇒ 下沿 90px（短边 = 屏高）
+        val square = toolbarStripRect(400f, 40f, 90f)!!
+        assertEquals(0f, square.left, 1e-4f)
+        assertEquals(400f, square.right, 1e-4f)
+
+        // 退化输入：**没有禁区**（宁可让切屏手势照旧，也不能把边缘手势封死）
+        assertNull(toolbarStripRect(Float.NaN, 46f, 104f))
+        assertNull(toolbarStripRect(466f, Float.NaN, 104f))
+        assertNull(toolbarStripRect(466f, 46f, Float.NaN))
+        assertNull(toolbarStripRect(0f, 46f, 104f))
+        assertNull(toolbarStripRect(466f, 104f, 46f))      // 上下沿反了
+        assertNull(toolbarStripRect(466f, 104f, 104f))     // 零高度
+        assertFalse(round.contains(Float.NaN, 75f))
+        assertFalse(round.contains(233f, Float.NaN))
+
+        // ===================================================================================
+        // 二、**长按出界判定**（本轮全局性要求）
+        //
+        // 用户原话："**把所有按钮的长按判定都改成只有在按钮的矩形框内才判定。**"
+        // 判据 = [pressInsideRect]（控件**自己的实测尺寸** + 一个极小的容差）。
+        // 这里钉住三条：矩形内为真、矩形外为假、容差就是那一丁点（不能大到够到隔壁）。
+        val w = 83.88f      // 图标键宽（41.94dp @d2）
+        val h = 58.25f      // 图标键高（29.13dp @d2）
+        val slack = minOf(w, h) * PRESS_INSIDE_SLACK_FRACTION
+        // ① 矩形内（含四条边）→ true
+        assertTrue(pressInsideRect(0f, 0f, w, h))
+        assertTrue(pressInsideRect(w, h, w, h))
+        assertTrue(pressInsideRect(w / 2f, h / 2f, w, h))
+        // ② 出界 → false（"手指一旦滑出这个矩形（哪怕只是飘出去），长按就作废"）
+        assertFalse("右侧飘出去就必须作废", pressInsideRect(w + slack + 0.01f, h / 2f, w, h))
+        assertFalse("左侧", pressInsideRect(-slack - 0.01f, h / 2f, w, h))
+        assertFalse("下方", pressInsideRect(w / 2f, h + slack + 0.01f, w, h))
+        assertFalse("上方", pressInsideRect(w / 2f, -slack - 0.01f, w, h))
+        // ③ 容差**极小**、而且方向对：刚刚好越过容差一点点就判 false
+        assertTrue("容差之内还算在里面（手指抖动要容忍）", pressInsideRect(w + slack - 0.01f, h / 2f, w, h))
+        // 圆表上换算成 px：短边 29.13dp × 2% ≈ 0.58dp ≈ 1.2px（用户要的"1~3px"那一档）
+        assertEquals(1.17f, slack, 0.05f)
+        assertTrue("容差必须远小于「够到隔壁」的距离（工具条两颗键之间 74.6px）", slack * 2f < 10f)
+        // ④ 退化 / 非法输入 → **true**（= "还算在里"）：宁可让长按照常成立，
+        //    也不要把用户的长按吞掉（尺寸还没量出来的那一帧就是 0×0）
+        assertTrue(pressInsideRect(0f, 0f, 0f, 0f))
+        assertTrue(pressInsideRect(999f, 999f, 0f, h))
+        assertTrue(pressInsideRect(Float.NaN, 0f, w, h))
+        assertTrue(pressInsideRect(0f, Float.NaN, w, h))
+        assertTrue(pressInsideRect(0f, 0f, Float.NaN, h))
+        assertTrue(pressInsideRect(0f, 0f, w, Float.NaN))
+        assertTrue(pressInsideRect(0f, 0f, -10f, -10f))
+        // ⑤ 比例是"控件自己**短边**的 2%"：控件越小容差越小（不会在小键上放大到够到隔壁）
+        //    —— 注意基准是 **min(宽, 高)**，所以这个 20×10 的控件容差 = 10 × 2% = 0.2（不是 0.4）
+        val smallSlack = 10f * PRESS_INSIDE_SLACK_FRACTION
+        assertTrue(smallSlack < slack)
+        assertTrue(pressInsideRect(20f + smallSlack - 0.01f, 10f, 20f, 10f))
+        assertFalse(pressInsideRect(20f + smallSlack + 0.01f, 10f, 20f, 10f))
+        // 同理：宽高互换时容差跟着短边走（横长条与竖长条的容差都是短边那一维）
+        assertEquals(
+            minOf(200f, 30f) * PRESS_INSIDE_SLACK_FRACTION,
+            minOf(30f, 200f) * PRESS_INSIDE_SLACK_FRACTION,
+            1e-4f
+        )
+    }
+
+    @Test
+    fun `菜单展开：本体从中间长出来、两端的键让位、抓手淡出（单调且不返回 NaN）`() {
+        // ---- 收起态：本体完全透明、两端在岗、抓手可见 ----
+        assertEquals(0f, toolbarMenuPanelAlpha(0f), 1e-4f)
+        assertEquals(TOOLBAR_MENU_PANEL_SCALE_X_FROM, toolbarMenuPanelScaleX(0f), 1e-4f)
+        assertEquals(TOOLBAR_MENU_PANEL_SCALE_Y_FROM, toolbarMenuPanelScaleY(0f), 1e-4f)
+        assertEquals(1f, toolbarMenuEndKeyAlpha(0f), 1e-4f)
+        assertEquals(1f, toolbarMenuEndKeyScale(0f), 1e-4f)
+        assertEquals(0f, toolbarMenuEndKeyShiftPx(242.4f, 0f, toRight = true), 1e-4f)
+        assertEquals(1f, toolbarMenuHandleAlpha(0f), 1e-4f)
+        // ---- 展开态 ----
+        assertEquals(1f, toolbarMenuPanelAlpha(1f), 1e-4f)
+        assertEquals(1f, toolbarMenuPanelScaleX(1f), 1e-4f)
+        assertEquals(1f, toolbarMenuPanelScaleY(1f), 1e-4f)
+        assertEquals(TOOLBAR_MENU_END_KEY_ALPHA, toolbarMenuEndKeyAlpha(1f), 1e-4f)
+        assertEquals(TOOLBAR_MENU_END_KEY_SCALE, toolbarMenuEndKeyScale(1f), 1e-4f)
+        assertEquals("展开之后那道细横线完全淡出", 0f, toolbarMenuHandleAlpha(1f), 1e-4f)
+        // 横向从 0.30 涨到 1（"从中间长出来"），纵向只从 0.60 涨到 1
+        assertTrue(TOOLBAR_MENU_PANEL_SCALE_X_FROM < TOOLBAR_MENU_PANEL_SCALE_Y_FROM)
+        // ---- 两端**朝屏幕外**让开 4% 行宽（圆表行宽 121.2dp → 4.85dp）----
+        assertEquals(
+            242.4f * 0.04f,
+            toolbarMenuEndKeyShiftPx(242.4f, 1f, toRight = true),
+            1e-3f
+        )
+        assertEquals(
+            -242.4f * 0.04f,
+            toolbarMenuEndKeyShiftPx(242.4f, 1f, toRight = false),
+            1e-3f
+        )
+        // ---- 单调性：中途任何一帧都不许倒回去（"抽搐"那类动画的长相）----
+        var prevPanel = toolbarMenuPanelAlpha(0f)
+        var prevEnd = toolbarMenuEndKeyAlpha(0f)
+        var prevHandle = toolbarMenuHandleAlpha(0f)
+        var prevShift = toolbarMenuEndKeyShiftPx(242.4f, 0f, toRight = true)
+        for (i in 1..20) {
+            val p = i / 20f
+            val panel = toolbarMenuPanelAlpha(p)
+            val end = toolbarMenuEndKeyAlpha(p)
+            val handle = toolbarMenuHandleAlpha(p)
+            val shift = toolbarMenuEndKeyShiftPx(242.4f, p, toRight = true)
+            assertTrue("本体的透明度只能涨：$prevPanel → $panel", panel >= prevPanel - 1e-5f)
+            assertTrue("两端的键只能越来越暗：$prevEnd → $end", end <= prevEnd + 1e-5f)
+            assertTrue("抓手只能越来越淡：$prevHandle → $handle", handle <= prevHandle + 1e-5f)
+            assertTrue("两端的键只能一直往外让：$prevShift → $shift", shift >= prevShift - 1e-5f)
+            prevPanel = panel
+            prevEnd = end
+            prevHandle = handle
+            prevShift = shift
+        }
+        // ---- 进度越界只当 0..1；非法输入绝不返回 NaN（NaN 进图层 = 整行消失）----
+        assertEquals(1f, toolbarMenuPanelAlpha(9f), 1e-4f)
+        assertEquals(0f, toolbarMenuPanelAlpha(-9f), 1e-4f)
+        assertEquals(0f, toolbarMenuPanelAlpha(Float.NaN), 1e-4f)
+        assertEquals(1f, toolbarMenuPanelScaleX(Float.NaN), 1e-4f)
+        assertEquals(1f, toolbarMenuPanelScaleY(Float.NaN), 1e-4f)
+        assertEquals(1f, toolbarMenuEndKeyAlpha(Float.NaN), 1e-4f)
+        assertEquals(1f, toolbarMenuEndKeyScale(Float.NaN), 1e-4f)
+        assertEquals(1f, toolbarMenuHandleAlpha(Float.NaN), 1e-4f)
+        assertEquals(0f, toolbarMenuEndKeyShiftPx(Float.NaN, 1f, toRight = true), 1e-4f)
+        assertEquals(0f, toolbarMenuEndKeyShiftPx(242.4f, Float.NaN, toRight = true), 1e-4f)
+        // ---- 两颗箭头键放得进工具条那一条（不会压到两端的键上）----
+        // 单颗键宽 = 0.18 短边（`WatchMetrics.iconButton`，形状锁定的图标键）；
+        // 圆表上工具条那一条的宽度比例 = 0.52（`FunctionList.MIN_ROW_WIDTH`，
+        // 也是 `toolbarWidthFraction` 的下限）→ 两颗键 + 一条缝必须放得下。
+        assertTrue(
+            "两颗箭头键（0.18 × 2）+ 缝放进 0.52 的工具条里",
+            2f * 0.18f + TOOLBAR_MENU_GAP <= 0.52f
+        )
+    }
+
+    // ---- 七、本地存档那一行「设置」的编解码（本轮「设置没被记住」那个 bug 的一半） ----
+    //
+    // 用户原话："软件的设置，你没有添加记忆功能。每次我打开软件之前设置过的东西都会
+    // 回归默认。"
+    //
+    // 查出来的真因**有两处**，一处只能离线钉住（字段顺序 / 缺段补齐），一处是判据本身：
+    //   1. `Store.load` 把**整份存档**挂在那份函数列表上（"函数列表为空 → 返回 null"），
+    //      而调用点是 `Store.load(context)?.let { 恢复设置 }` —— 只要用户一条函数都没有，
+    //      设置就永远读不回来（切坐标系会清空全部函数）。判据抽成
+    //      `archiveHasContent`，下面第一条测试钉着它；
+    //   2. 设置那一行的**字段顺序**原来是"写一处、读一处，靠人对齐"（这个项目往末尾
+    //      追加过三段设置）。现在顺序只有 `SettingsFields` 一份，往返、逐段、缺段、
+    //      坏行四条都在下面钉着。
+
+    @Test
+    fun `存档"还有没有东西可读"：函数列表为空不等于存档作废（设置丢失的真因）`() {
+        // 四个键**互不依赖**：任何一个有值，这份存档就该被读回来。
+        assertFalse(
+            "四个键一个都没有 = 真·全新安装（只有这时才该回默认值）",
+            archiveHasContent(hasFunctions = false, hasSettings = false, hasView = false, hasSliders = false)
+        )
+        assertTrue(
+            "只有设置也照样读回来 —— 这一条就是本轮修的那一条",
+            archiveHasContent(false, true, false, false)
+        )
+        assertTrue("只有视野也读", archiveHasContent(false, false, true, false))
+        assertTrue("只有滑动条也读", archiveHasContent(false, false, false, true))
+        assertTrue("有函数当然读", archiveHasContent(true, false, false, false))
+        assertTrue(archiveHasContent(true, true, true, true))
+    }
+
+    /** 逐段核对：把**某一段**翻个值，只有那一段变 —— 顺序漂了这里立刻红。 */
+    private fun assertSegment(f: SettingsFields, index: Int, expect: String) {
+        val parts = f.encode().split(SettingsFields.SEPARATOR)
+        assertEquals("设置行的段数必须是 ${SettingsFields.FIELD_COUNT}", SettingsFields.FIELD_COUNT, parts.size)
+        assertEquals("设置行第 ${index + 1} 段的顺序漂了", expect, parts[index])
+    }
+
+    @Test
+    fun `设置行：写的顺序和读的顺序是同一份，段数就是 10`() {
+        assertEquals(10, SettingsFields.FIELD_COUNT)
+        // 全默认：逐段核对（这就是"顺序的唯一真相"那张表）
+        val def = SettingsFields()
+        assertSegment(def, index = 0, expect = "0")   // 坐标系序号（CARTESIAN）
+        assertSegment(def, index = 1, expect = "1")   // 网格（默认显示）
+        assertSegment(def, index = 2, expect = "1")   // 坐标轴
+        assertSegment(def, index = 3, expect = "0")   // 坐标数字（默认隐藏）
+        assertSegment(def, index = 4, expect = "1")   // 函数示例
+        assertSegment(def, index = 5, expect = "1")   // 切坐标系要确认
+        assertSegment(def, index = 6, expect = "0")   // 度制（默认弧度）
+        assertSegment(def, index = 7, expect = "1")   // 屏蔽系统手势（默认开）
+        assertSegment(def, index = 8, expect = "0")   // 按键缩放栏（默认关）
+        assertSegment(def, index = 9, expect = "1")   // "回到移动"提示（默认要弹一次）
+        // 逐段翻转：只有那一段从 1 变 0（顺序、判据、编码三件事一起钉住）
+        assertSegment(SettingsFields(showGrid = false), 1, "0")
+        assertSegment(SettingsFields(showAxes = false), 2, "0")
+        assertSegment(SettingsFields(showNumbers = true), 3, "1")
+        assertSegment(SettingsFields(showPresets = false), 4, "0")
+        assertSegment(SettingsFields(confirmCoordSwitch = false), 5, "0")
+        assertSegment(SettingsFields(degrees = true), 6, "1")
+        assertSegment(SettingsFields(blockSystemGestures = false), 7, "0")
+        assertSegment(SettingsFields(showZoomBar = true), 8, "1")
+        assertSegment(SettingsFields(confirmReturnToMove = false), 9, "0")
+        assertSegment(SettingsFields(coordinateSystem = 2), 0, "2")
+
+        // 往返：编码 → 解码 → 每一个字段都回来（"写进去读不回来"这类 bug 的正中央）
+        val all = SettingsFields(
+            coordinateSystem = 2,
+            showGrid = false,
+            showAxes = false,
+            showNumbers = true,
+            showPresets = false,
+            confirmCoordSwitch = false,
+            degrees = true,
+            blockSystemGestures = false,
+            showZoomBar = true,
+            confirmReturnToMove = false
+        )
+        val back = SettingsFields.decode(all.encode(), coordinateSystemCount = 3)
+        assertEquals(all.coordinateSystem, back.coordinateSystem)
+        assertEquals(all.showGrid, back.showGrid)
+        assertEquals(all.showAxes, back.showAxes)
+        assertEquals(all.showNumbers, back.showNumbers)
+        assertEquals(all.showPresets, back.showPresets)
+        assertEquals(all.confirmCoordSwitch, back.confirmCoordSwitch)
+        assertEquals(all.degrees, back.degrees)
+        assertEquals(all.blockSystemGestures, back.blockSystemGestures)
+        assertEquals(all.showZoomBar, back.showZoomBar)
+        assertEquals(all.confirmReturnToMove, back.confirmReturnToMove)
+        // 另一头（全默认）也要往返：默认值本身不会被当成"缺段"
+        assertSegment(SettingsFields.decode(def.encode(), 3), 3, "0")
+        assertSegment(SettingsFields.decode(def.encode(), 3), 7, "1")
+    }
+
+    @Test
+    fun `老存档照读：缺的段按各自的默认值补，坏行整组退回默认，多出来的段忽略`() {
+        // 最老的四段（坐标系 / 网格 / 坐标轴 / 坐标数字）
+        val oldest = SettingsFields.decode("0,1,0,1", coordinateSystemCount = 3)
+        assertEquals(0, oldest.coordinateSystem)
+        assertTrue(oldest.showGrid)
+        assertFalse(oldest.showAxes)
+        assertTrue(oldest.showNumbers)
+        // 后面六段全部按**各自的**默认值补 —— 方向是有意设计过的（见 `SettingsFields`）
+        assertTrue("缺第 5 段 → 当作显示示例", oldest.showPresets)
+        assertTrue("缺第 6 段 → 当作切坐标系要问", oldest.confirmCoordSwitch)
+        assertFalse("缺第 7 段 → 弧度制", oldest.degrees)
+        assertTrue("缺第 8 段 → 屏蔽系统手势当作开（升级上来的老用户必须继续开着）", oldest.blockSystemGestures)
+        assertFalse("缺第 9 段 → 不显示缩放栏", oldest.showZoomBar)
+        assertTrue("缺第 10 段 → \"回到移动\"提示当作要弹一次", oldest.confirmReturnToMove)
+
+        // 七段 / 九段的老存档（项目真实存在过的两代格式）同样照读
+        val seven = SettingsFields.decode("0,1,1,0,0,0,1", 3)
+        assertEquals("第 7 段 = 度制", true, seven.degrees)
+        assertTrue("第 8 段缺失 → 默认开", seven.blockSystemGestures)
+        val nine = SettingsFields.decode("0,1,1,0,0,0,1,0,1", 3)
+        assertEquals("第 8 段 = 屏蔽系统手势（0）", false, nine.blockSystemGestures)
+        assertEquals("第 9 段 = 缩放栏（1）", true, nine.showZoomBar)
+        assertTrue("第 10 段缺失 → 默认 true", nine.confirmReturnToMove)
+
+        // 后版本往末尾追加了两段（12 段）：前 10 段照读，多出来的忽略（前向兼容）
+        val future = SettingsFields.decode("0,0,0,0,0,0,0,0,0,0,1,1", 3)
+        assertFalse("第 2 段 = 网格（0）", future.showGrid)
+        assertFalse("第 10 段 = 提示（0）", future.confirmReturnToMove)
+
+        // 坏行一律**整组**退回默认（不拿半截存档去改界面）：
+        // 注意 "9,0,0,0" 这一条 —— 它的网格段是 0，如果没整组退回就会被读成"隐藏网格"，
+        // 所以下面断言的是"网格回到默认的 true"（这一条才真的钉住了"整组退回"）。
+        for (bad in listOf<String?>(null, "", "x", "0,1", "0,1,1", "9,0,0,0", "-1,0,0,0", "a,0,0,0")) {
+            val f = SettingsFields.decode(bad, 3)
+            assertEquals("坏行 $bad：坐标系退回默认", 0, f.coordinateSystem)
+            assertTrue("坏行 $bad：整组退回默认（网格=显示）", f.showGrid)
+        }
+        // 坐标系种类数传 0（坏参数）：同样整组退回默认，且**不越界**（不抛异常）
+        assertEquals(0, SettingsFields.decode("2,1,1,0", coordinateSystemCount = 0).coordinateSystem)
+        // 合法的序号照读（本版本 3 种坐标系）
+        assertEquals(2, SettingsFields.decode("2,0,0,0", 3).coordinateSystem)
     }
 }

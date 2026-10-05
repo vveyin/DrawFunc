@@ -1027,6 +1027,102 @@ fun swipeDeleteTranslationPx(dragXPx: Float, rowWidthPx: Float, sweep: Float): F
 }
 
 /**
+ * 一行「左滑删除」的**跟手位移状态机**（纯 Kotlin）—— 真机上那一份是
+ * `DragGestures.RowSwipeDelete`，它把这个类包起来，界面只读它同步出来的镜像。
+ *
+ * ## 为什么要有这个类（用户报的第二个动画 bug 的真因就在"什么时候把位移归零"上）
+ *
+ * 用户原话："函数列表删除的动画有点抽搐，把一个对象从右往左滑删除之后还会从中间
+ * 再往左滑动，实际应该是从松手的位置就继续滑动，而不是从中间再滑动。"
+ *
+ * 上一轮修的是**方向**（合成位移必须是 `跟手 + 甩出`，两个负数相加），这一轮的问题是
+ * **起点**：松手那一刻行已经在"跟手位置"上了，可是甩出动画却从**另一个基准**开始 ——
+ * 于是用户先看到行弹回它自己的位置（屏幕上就是"中间"），再从那往左滑出去。
+ *
+ * 那个"另一个基准"就是被清零的跟手位移本身，清零的元凶在 `awaitEachGesture` 的循环形状里：
+ *
+ * ```
+ * awaitEachGesture {          // 循环体 = 一串手势
+ *     dragX = 0f              // ← 就是这一句（它写在循环体的第一行）
+ *     awaitOneWayDrag(...)    //    里面等 down、跟手、抬手时回调 onEnd
+ * }
+ * ```
+ *
+ * 反编译 1.7.0 的 `ForEachGestureKt` 可以看到它的循环体是
+ * `while (isActive) { block(); awaitAllPointersUp() }` —— 而 `awaitAllPointersUp()`
+ * 在"最后一个事件已经是抬手"时**立即返回**（第一句就是判 `currentEvent`）。
+ * 所以顺序是：
+ *
+ * 1. 抬手那帧：`onEnd` 里 `scope.launch { sweep 动画 }`（只是**排队**，下一帧才跑）
+ *    → 然后函数返回，`dragX` 此刻还是**松手位置**；
+ * 2. 同一个调度里：`block()` 立刻被**再调一次** → 第一句 `dragX = 0f` 执行；
+ * 3. 下一帧动画才真正开始跑，此时 `translationX = 0 + 甩出` —— 行已经在"中间"了。
+ *
+ * 两条加起来就是用户看到的"先弹回中间、再从中间往左滑"。它不是缓动、不是时长、
+ * 也不是方向的问题（那三样上一轮都对齐过了），纯粹是**时序**：
+ * 位移在"这一串手势结束"和"甩出动画开始"之间被抹掉了。
+ *
+ * ## 修法：甩出期间**不许归零**
+ *
+ * 归零只在"上一串没有进入甩出阶段"时才做（[beginGesture]），而 [release] 一旦判定
+ * "够远要删"就把 [sweeping] 立起来 —— 此后这一串的收尾、以及任何提前转回来的循环，
+ * 都不会再碰 [followPx]。行因此停在松手的位置上，[translationPx] 从那里继续往左叠加。
+ *
+ * 为什么"不用管什么时候把它放下来"：`release` 返回 true 之后调用方会调 `onDelete()`，
+ * 这一行会被状态层从列表里摘掉、连同本对象一起消失（这是"甩出去"的语义本身）。
+ * 万一哪一行没被真的摘掉（理论上不该发生），它也只是停在屏幕外（`sweep` 停在 1、
+ * alpha 0）、而不是回弹回来闪一下 —— 这个方向的失败是可接受的。
+ *
+ * ⚠️ 三行（函数行 / 几何对象行 / 滑动条行）共用 `DragGestures.rememberRowSwipeDelete`，
+ * 也就是共用这个类，所以"从松手位置继续甩"在三行上**是同一件事**，不是三份实现。
+ */
+class SwipeDeleteMotion {
+
+    /** 跟手位移（px，往左为负）。0 = 行还在它自己的位置上。 */
+    var followPx: Float = 0f
+        private set
+
+    /** true = 这一行已经进入"被扔掉"阶段（甩出动画在播，马上就会被删掉）。 */
+    var sweeping: Boolean = false
+        private set
+
+    /**
+     * 一串手势开始了（`awaitEachGesture` 的循环体转回来时）。
+     *
+     * **甩出期间不归零** —— 见类注释：正常抬手之后循环体会立刻回来一次，
+     * 那一次归零正是"从中途重新开始滑"的真因。
+     */
+    fun beginGesture() {
+        if (!sweeping) followPx = 0f
+    }
+
+    /** 手指每动一帧：`totalPx` = 从落点算起的**带符号**累计位移。 */
+    fun drag(totalPx: Float) {
+        if (!sweeping) followPx = swipeDeleteFollow(totalPx)
+    }
+
+    /**
+     * 抬手。
+     *
+     * @return true = 够远、这一行要甩出去（调用方去播甩出动画，**并且不要再碰位移**）；
+     *   false = 不够远，行弹回原位（[followPx] 已经归零）。
+     */
+    fun release(totalPx: Float, rowWidthPx: Float): Boolean {
+        if (sweeping) return false
+        if (!swipeDeleteReached(totalPx, rowWidthPx)) {
+            followPx = 0f
+            return false
+        }
+        sweeping = true
+        return true
+    }
+
+    /** 这一行此刻该画在哪（px，往左为负）= 跟手位移 + 甩出位移。 */
+    fun translationPx(rowWidthPx: Float, sweep: Float): Float =
+        swipeDeleteTranslationPx(followPx, rowWidthPx, sweep)
+}
+
+/**
  * 「单向拖动」认不认领这一串手势的判据：**越过触摸容差、而且方向对**。
  *
  * 这是 `DragGestures.awaitOneWayDrag` 里唯一的判定。单独抽出来是为了能离线钉住它 ——
@@ -1267,4 +1363,550 @@ fun sliderPressOnPlayKey(xPx: Float, playLeftPx: Float, playRightPx: Float): Boo
     if (!xPx.isFinite() || !playLeftPx.isFinite() || !playRightPx.isFinite()) return false
     if (playRightPx < playLeftPx) return false
     return xPx >= playLeftPx && xPx <= playRightPx
+}
+
+// ===================================================================================
+// 五、顶部工具条上那条「横着滑一下唤出撤销 / 重做菜单」的尺度
+//
+// ## 用户要的是什么（含本轮那条**关键补充**）
+//
+// 原话："给这个软件加一个撤销的功能，在函数列表界面，从设置滑到加号。按键可以在设置和
+// 加号那一条的地方显示出撤销菜单有左箭头和右箭头。然后在功能列表界面从文件夹滑到删除
+// 也是一样的道理。从加号滑到设置和从删除滑到文件夹，也可以调出来撤销按钮。"
+//
+// 补充（本轮）："**按出撤销菜单的条件是从顶部的一个按钮滑到另一个按钮，请不要给顶部的
+// 按钮还没有滑到另一个按钮的时候就加动画。**"
+//
+// 也就是**两屏各一处**、同一件事，而且判据是**几何**的、不是"拖了多远"：
+//   * 第一屏从 ⚙ 滑到 `+`（或反过来）；第二屏从 📁 滑到 🗑（或反过来）；
+//   * **必须真的越过两颗键之间那道空当、进入另一颗键的矩形**才算达成；
+//   * **达成之前一帧动画都没有**（顶部的键不动、菜单不半开、不预先让位）——
+//     所以本节的判定里**没有"跟手进度"这种东西**：只有"到了/没到"两个状态。
+//
+// ## 为什么这些数住在本文件（而不是 `Common.kt` / 两屏里各写一份）
+//
+// 和上面四节**同一条理由**：它们是纯算术、零 Android/Compose 依赖，却决定了
+// "什么算滑到了另一颗键""两端的键让开多少""菜单怎么展开"这些用户一眼能看到的行为。
+// 它们不该只靠"装到设备上滑一下"来验证 —— 而"能不能被那个脚本编进去"是这个包里
+// **文件位置**的硬约束（`tools\run-tool-tests.ps1` 只编固定的八个 .kt），所以纯算术
+// 只能住在这里，断言在 `PlotMetricsTest` 末尾那一组。
+//
+// ## 两颗键在工具条上的**真实位置**（判定的全部依据）
+//
+// 工具条那一行的版面是：`Row(Modifier.fillMaxSize(), Arrangement.SpaceBetween)` 里放
+// **两颗** `WatchIconButton`，所以行内坐标（行左沿 = 0，单位 px）恒为：
+//
+// ```
+//   左键矩形 [0, w]                        右键矩形 [行宽 − w, 行宽]
+//   中间那道空当 (w, 行宽 − w)             w = metrics.iconButton（= 0.18 × 短边，形状锁定）
+//   ↑ 起点落在空当里的横滑**不算**（那是给"顶部下滑回图像"留的活路，见 `Common.kt`）
+// ```
+//
+// 三块屏上的实算（行宽 = 圆屏弧宽比例 / 非圆屏"屏宽 − 左右各 3%"，见 `ScreenGeometry.rowWidth`）：
+//
+// | 设备 | 行宽 | 单键宽 w | 左键矩形 | 右键矩形 | **中间空当**（最短行程） | **中心距**（典型行程） |
+// |---|---|---|---|---|---|---|
+// | 圆表 233dp | 121.2dp | 41.9dp | [0, 41.9] | [79.2, 121.2] | **37.3dp** | **79.2dp** |
+// | 方表 200dp | 104.0dp | 36.0dp | [0, 36.0] | [68.0, 104.0] | **32.0dp** | **68.0dp** |
+// | 手机 411dp | 386.3dp | 74.0dp | [0, 74.0] | [312.4, 386.3] | **238.4dp** | **312.4dp** |
+//
+// 读这张表要看出两件事：
+//   * **"随便横拖一点"不可能达成** —— 最短行程 = 空当宽度，圆表 37.3dp（74.6px @d2）
+//     是触摸容差（≈24px）的 3 倍，方表 64px、手机 655px 更不必说。所以本节的判定
+//     **不需要**任何额外的距离阈值常量：几何本身就卡住了。
+//   * **典型行程 = 中心距**（从 ⚙ 的中心滑到 `+` 的中心）79.2dp（圆表）——
+//     这正是用户嘴里"从设置滑到加号"那一下。
+// ===================================================================================
+
+/** 工具条上两颗图标键的左右身份（[NONE] = 都没落在键上，也就是**中间那道空当**）。 */
+enum class ToolbarKeySide { NONE, LEFT, RIGHT }
+
+/**
+ * 落点 [xPx]（**工具条行内**坐标，行左沿 = 0）落在哪一颗键上。
+ *
+ * 判据就是上面那张表：左键矩形 `[0, w]`、右键矩形 `[行宽 − w, 行宽]`，两者**都含端点**
+ * （边界上不留一条"擦过去不算"的缝），中间那道空当返回 [ToolbarKeySide.NONE]。
+ *
+ * 非法 / 退化输入一律 [ToolbarKeySide.NONE]（= "这一次横滑与我们无关"）：
+ *   * 行宽或键宽非正、NaN；
+ *   * **两道键重叠**（`2w ≥ 行宽`，只在极端的坏版面上可能出现）—— 那时"进入另一颗键"
+ *     根本没有中间地带可言，宁可不认，也不能把一次点击当成"滑过去"。
+ * 负坐标（手指拖到行的左边外面）按同一把尺子判：它会先穿过空当、再进左键矩形，
+ * 于是"从右键出发往左拖出去"照样能达成（那是用户要的"从删除滑到文件夹"的同一件事）。
+ */
+fun toolbarKeyAt(xPx: Float, rowWidthPx: Float, keyWidthPx: Float): ToolbarKeySide {
+    if (!xPx.isFinite() || !rowWidthPx.isFinite() || !keyWidthPx.isFinite()) return ToolbarKeySide.NONE
+    if (rowWidthPx <= 0f || keyWidthPx <= 0f) return ToolbarKeySide.NONE
+    if (keyWidthPx * 2f >= rowWidthPx) return ToolbarKeySide.NONE
+    if (xPx <= keyWidthPx) return ToolbarKeySide.LEFT
+    if (xPx >= rowWidthPx - keyWidthPx) return ToolbarKeySide.RIGHT
+    return ToolbarKeySide.NONE
+}
+
+/**
+ * 这一次横滑**达成**了吗 —— 用户那条补充的判据本体。
+ *
+ * `startedAt` = 落点在哪颗键上（[toolbarKeyAt] 在 down 那一刻算的），
+ * [nowXPx] = 手指**此刻**的行内 x（= 落点 + 我们自己累计的横向位移）。
+ *
+ * 达成的定义（三个条件，缺一不可）：
+ *   1. 起手落在**某一颗键**上（[startedAt] 不是 [ToolbarKeySide.NONE]）——
+ *      "从顶部的一个按钮滑到另一个按钮"里那个"从"；
+ *   2. 手指此刻进了**另一颗键**的矩形 —— 那个"到"；
+ *   3. 于是"越过两颗键之间那道空当"是它蕴含的（从一颗键的矩形到另一颗键的矩形，
+ *      中间必须走完整条空当）。
+ *
+ * 调用方**每帧**拿手指当前 x 问它一次，第一次为真就是"滑到了"的那一刻
+ * （`Common.kt` 因此可以**在手指还按着的时候就展开菜单**，用户要的就是这个直接反馈）。
+ */
+fun toolbarMenuCrossedToOtherKey(
+    startedAt: ToolbarKeySide,
+    nowXPx: Float,
+    rowWidthPx: Float,
+    keyWidthPx: Float
+): Boolean {
+    if (startedAt == ToolbarKeySide.NONE) return false
+    val now = toolbarKeyAt(nowXPx, rowWidthPx, keyWidthPx)
+    return now != ToolbarKeySide.NONE && now != startedAt
+}
+
+/**
+ * 两颗键的**中心距**（px）—— "从设置滑到加号"那一下的典型行程。
+ *
+ * = `行宽 − 键宽`（左键中心 w/2 → 右键中心 行宽 − w/2）。
+ * 它不在判定里（判定用的是"进另一颗键的矩形"，见 [toolbarMenuCrossedToOtherKey]），
+ * 存在的意义有两个：
+ *   * **离线测试拿它对拍"典型行程"**（圆表 79.2dp、方表 68.0dp、手机 312.4dp）；
+ *   * 报告与注释里引用同一个数，不必各自算一遍。
+ */
+fun toolbarKeyCenterDistancePx(rowWidthPx: Float, keyWidthPx: Float): Float {
+    if (!rowWidthPx.isFinite() || !keyWidthPx.isFinite()) return 0f
+    return (rowWidthPx - keyWidthPx).coerceAtLeast(0f)
+}
+
+/**
+ * 两颗键之间那道**空当**的宽度（px）= `行宽 − 2 × 键宽`。
+ *
+ * 它同时是达成条件的**最短行程**（从一颗键的内沿起手、走到另一颗键的内沿）——
+ * 所以它证明了一件事：**不需要任何额外的距离阈值**，几何本身就保证"随便拖一点"不成立
+ * （圆表 74.6px、是触摸容差 ≈24px 的 3 倍）。退化版面（两道键重叠）返回 0。
+ */
+fun toolbarKeyGapPx(rowWidthPx: Float, keyWidthPx: Float): Float {
+    if (!rowWidthPx.isFinite() || !keyWidthPx.isFinite()) return 0f
+    return (rowWidthPx - keyWidthPx * 2f).coerceAtLeast(0f)
+}
+
+// -----------------------------------------------------------------------------------
+// 「工具条那一行」= 顶部那排按键所在的**整条全宽高度带** —— 这一块让给撤销菜单，切屏手势不认它
+//
+// ## 用户要求（原话，三轮，**以最后一句为准**）
+//
+//   1. "在能够唤出撤销菜单的按键的位置滑到另一个屏幕的判定应该取消掉。"
+//      —— 落在这一条里的横滑**只服务于撤销菜单**，不再切屏；
+//   2. "在右边缘手势的起手判据里把工具条那一段（**屏高 10%~22.5%**）排掉。"
+//   3. "**只排掉那一行本身。**"
+//      —— 上一句的 22.5% 是"按真实屏高"算出来的下沿，在手机上比那一行本身高 55dp；
+//         用户点名收掉，于是下沿改成**行顶 + 行高（行高按短边）**，也就是工具条 Box
+//         自己那两个式子，禁区**逐像素等于那一行**。
+//
+// 所以本函数的矩形 = **x ∈ [0, 整屏宽] × y ∈ [行顶, 行顶 + 行高]**：
+// 上沿 = `geometry.sy(TOOLBAR_TOP)`（占真实屏高 0.10）、下沿 = 上沿 + `0.125 × 短边`
+// （`TOOLBAR_H × metrics.sizeDp`），**左右沿就是整屏宽**（用户第 1、2 句说的都是"那一段"）。
+//
+// ⚠️ 这里要说清一个取舍（免得后人以为写错了）：**比行矩形更宽的那两部分其实并不冲突** ——
+// 撤销菜单的起手区是"某颗键的矩形"（见 [toolbarKeyAt]），两颗键都在行内，
+// 圆表上行两侧各空 55.9dp，那两块地方本来谁也唤不出菜单；把它们一并封掉，
+// "左边缘右滑"在这一带里就少了 55.9dp 的可用起手面。**但用户要求按高度一刀切**
+// （他只说"那一段/那一条"），所以就按他说的来：**左右全宽、上下就是那一行**。
+//
+// ## 两条切屏手势因此变成这样
+//
+// | 屏 | 原起手区 | 现在 |
+// |---|---|---|
+// | 第一屏「左边缘右滑进功能界面」 | x < 26% 屏宽、y ∈ 12%~92% | 同上，**但要排掉这一块**（圆表 y 23.3~52.4dp） |
+// | 第二屏「右边缘左滑回函数列表」 | x ≥ 74% 屏宽、全高 | 同上，**但要排掉这一块** |
+//
+// 实测（三块屏，**左右全宽、上下 = 那一行**；行顶 = 0.10 真实屏高、行高 = 0.125 短边）：
+//
+// | 设备 | 这一块（屏幕坐标） |
+// |---|---|
+// | 圆表 233dp / d2（短边 = 屏高） | **x ∈ [0, 233]dp（0~466px）、y ∈ [23.30, 52.43]dp**（46.60~104.85px） |
+// | 方表 200dp / d2（短边 = 屏高） | x ∈ [0, 200]dp（0~400px）、y ∈ [20.00, 45.00]dp（40.0~90.0px） |
+// | 手机 411 × 850dp / d2.75 | x ∈ [0, 411]dp（0~1130.25px）、y ∈ [85.00, 136.38]dp（233.75~375.03px） |
+//
+// 圆表与方表上短边 = 屏高，所以新旧口径**逐像素相同**（用户要求的"圆表不变"自动满足）；
+// 手机上新的下沿是 **136.38dp（375.03px）**，比旧口径的 191.25dp 少了 55dp ——
+// 那 55dp 就是"按真实屏高的 22.5%"多让出去的部分。
+// -----------------------------------------------------------------------------------
+
+/**
+ * 顶部工具条那一行的**整条全宽矩形**（px，屏幕坐标）—— 切屏手势的"禁区"。
+ *
+ * @param screenWidthPx 整屏宽（px）：**左右沿就是 0 与它**（用户点名的口径是"那一段"）。
+ * @param bandTopPx 这一块的上沿（px）= `geometry.syPx(TOOLBAR_TOP)`（行顶，0.10 真实屏高）。
+ * @param bandBottomPx 这一块的下沿（px）= 上沿 + `TOOLBAR_H × metrics.sizeDp`（行高，按**短边**）
+ *   —— 和工具条 Box 自己的 `.offset(y = geometry.sy(TOOLBAR_TOP))` / `.height(...)` 逐字同源，
+ *   所以禁区永远等于那一行。⚠️ 别再用 `geometry.syPx(TOOLBAR_TOP + TOOLBAR_H)`：
+ *   那是"真实屏高的 22.5%"，在手机上会比那一行高 55dp（用户明确要求"只排掉那一行本身"）。
+ *
+ * 非法输入（NaN / 非正的宽高）返回 `null` = "没有禁区"：
+ * 宁可让切屏手势照旧，也不能因为一个坏尺寸把边缘手势整块封死。
+ *
+ * ⚠️ 它是 **data class**（值相等）：调用点把它当 `pointerInput` 的 key 用 ——
+ * 值没变（同一块屏、同一个版面）就不会重启手势协程，屏形一变（旋转 / 分屏）才重启，
+ * 于是"切屏手势读到的禁区"永远是**当前**那一块，不会拿着上一次组合的旧矩形。
+ */
+data class ToolbarStripRect(val left: Float, val top: Float, val right: Float, val bottom: Float) {
+
+    /** 这一点（屏幕 px）在这一条里吗（四条边**都算在内**）。 */
+    fun contains(xPx: Float, yPx: Float): Boolean {
+        if (!xPx.isFinite() || !yPx.isFinite()) return false
+        return xPx >= left && xPx <= right && yPx >= top && yPx <= bottom
+    }
+}
+
+/** 造出"工具条那一条"的整条全宽矩形（见 [ToolbarStripRect] 的说明；退化输入返回 null）。 */
+fun toolbarStripRect(
+    screenWidthPx: Float,
+    bandTopPx: Float,
+    bandBottomPx: Float
+): ToolbarStripRect? {
+    if (!screenWidthPx.isFinite() || !bandTopPx.isFinite() || !bandBottomPx.isFinite()) return null
+    if (screenWidthPx <= 0f || bandBottomPx <= bandTopPx) return null
+    return ToolbarStripRect(
+        left = 0f,
+        top = bandTopPx,
+        right = screenWidthPx,
+        bottom = bandBottomPx
+    )
+}
+
+/**
+ * 菜单展开时，**两端的键**（⚙/`+`、📁/🗑）各自朝屏幕外让开的距离（占工具条行宽）。
+ *
+ * 为什么是"朝外"而不是"朝中间"：菜单是从**中间**长出来的，两端的键必须把中间让出来；
+ * 朝中间收只会和箭头键撞在一起。0.04 × 行宽在圆表上是 4.8dp ——
+ * 只是"让了一下"的暗示，不会把键推出屏幕（行两端离屏幕边还有 55.9dp）。
+ *
+ * ⚠️ 它**只在达成之后**才动（进度由 `openState` 驱动，见 `Common.kt`）：
+ * 没滑到另一颗键的那一串手势里，这个位移恒为 0 —— 用户明确要求过
+ * "还没滑到另一个按钮的时候不要加动画"。
+ */
+const val TOOLBAR_MENU_YIELD = 0.04f
+
+/** 两颗箭头键之间的缝（占**短边**），和工具条那两颗按钮的缝同一个量级。 */
+const val TOOLBAR_MENU_GAP = 0.014f
+
+/**
+ * 两端的键让开的横向位移（px，**朝屏幕外**为正负号见 [toRight]）。
+ *
+ * @param toRight true = 右边那颗（`+` / 🗑，往右让）；false = 左边那颗（⚙ / 📁，往左让）。
+ * @param progress 菜单展开进度 0..1。
+ */
+fun toolbarMenuEndKeyShiftPx(rowWidthPx: Float, progress: Float, toRight: Boolean): Float {
+    if (!rowWidthPx.isFinite() || !progress.isFinite()) return 0f
+    val d = rowWidthPx * TOOLBAR_MENU_YIELD * progress.coerceIn(0f, 1f)
+    return if (toRight) d else -d
+}
+
+/**
+ * 菜单展开时两端那两颗键的不透明度：1 → [TOOLBAR_MENU_END_KEY_ALPHA]。
+ *
+ * 为什么是**变暗**而不是缩小消失：它们的位置和点击区在动画期间**一个像素都不动**
+ * （只动图层），所以"暗下去但还在原地"才是诚实的 —— 用户这时候点那颗位置，
+ * 点到的仍然是 ⚙（设置）/ 📁（函数文件），不会点空。
+ */
+fun toolbarMenuEndKeyAlpha(progress: Float): Float =
+    if (!progress.isFinite()) 1f
+    else 1f - (1f - TOOLBAR_MENU_END_KEY_ALPHA) * progress.coerceIn(0f, 1f)
+
+/** 两端那两颗键"让位"时缩到多少。0.82：看得出退了一步，又不至于让图标糊掉。 */
+const val TOOLBAR_MENU_END_KEY_SCALE = 0.82f
+
+/** 两端那两颗键最终暗到多少（= 0.18）。 */
+const val TOOLBAR_MENU_END_KEY_ALPHA = 0.18f
+
+/** [toolbarMenuEndKeyAlpha] 的缩放同伴：1 → [TOOLBAR_MENU_END_KEY_SCALE]。 */
+fun toolbarMenuEndKeyScale(progress: Float): Float =
+    if (!progress.isFinite()) 1f
+    else 1f - (1f - TOOLBAR_MENU_END_KEY_SCALE) * progress.coerceIn(0f, 1f)
+
+/**
+ * 撤销菜单本体（那两颗箭头键所在的那一行）的展开比例。
+ *
+ * ## 为什么是"宽度先长、高度随后、透明度从头跟到尾"
+ *
+ * 用户要求"从中间**展开**（宽度/透明度/缩放一起动）"。三个量分开取不同区间，
+ * 合起来才是"展开"而不是"放大"：
+ *   * **横向** 0.30 → 1.00：它主要表达"这东西是从中间往两边长出来的"；
+ *   * **纵向** 0.60 → 1.00：只收一点，因为两颗键的高度本来就是固定的（0.125 短边），
+ *     纵向压太多会看起来像"从一个小点里蹦出来"，反而像故障；
+ *   * **透明度** 0 → 1：线性跟进度走，收起时反向 —— 于是"淡出"和"缩回去"同时发生。
+ *
+ * 只动 `graphicsLayer`：菜单的占位尺寸在动画期间不变，所以工具条那一行、
+ * 下面列表的上沿**一帧都不会抖**（这是用户明确要求过的"不要让布局抖动"）。
+ */
+fun toolbarMenuPanelScaleX(progress: Float): Float =
+    if (!progress.isFinite()) 1f
+    else TOOLBAR_MENU_PANEL_SCALE_X_FROM +
+        (1f - TOOLBAR_MENU_PANEL_SCALE_X_FROM) * progress.coerceIn(0f, 1f)
+
+/** 见 [toolbarMenuPanelScaleX]：纵向 0.60 → 1.00。 */
+fun toolbarMenuPanelScaleY(progress: Float): Float =
+    if (!progress.isFinite()) 1f
+    else TOOLBAR_MENU_PANEL_SCALE_Y_FROM +
+        (1f - TOOLBAR_MENU_PANEL_SCALE_Y_FROM) * progress.coerceIn(0f, 1f)
+
+/** 菜单本体的不透明度：0 → 1（线性）。 */
+fun toolbarMenuPanelAlpha(progress: Float): Float =
+    if (!progress.isFinite()) 0f else progress.coerceIn(0f, 1f)
+
+/** 菜单展开时横向从 0.30 起（见 [toolbarMenuPanelScaleX]）。 */
+const val TOOLBAR_MENU_PANEL_SCALE_X_FROM = 0.30f
+
+/** 菜单展开时纵向从 0.60 起（见 [toolbarMenuPanelScaleX]）。 */
+const val TOOLBAR_MENU_PANEL_SCALE_Y_FROM = 0.60f
+
+/**
+ * 工具条上方那道**细横线**（顶部抓手）在菜单展开时的不透明度：1 → 0。
+ *
+ * 为什么要动它：那道小胶囊是"这里能滑"的语言，而撤销菜单展开之后，
+ * 中间要表达的是"这里是两个键" —— 两个"中间"的东西叠在一起会互相干扰。
+ * 淡出它（只 160ms）比留着更干净，也让"展开"这件事多一个看得见的层次。
+ */
+fun toolbarMenuHandleAlpha(progress: Float): Float =
+    if (!progress.isFinite()) 1f else 1f - progress.coerceIn(0f, 1f)
+
+// ===================================================================================
+// 六、本地存档里那一行「设置」的文本编解码（`Store` 的 `KEY_SETTINGS`）
+//
+// ## 为什么它住在本文件（这一条是"修 bug 的一半"，不是洁癖）
+//
+// 用户报的 bug："软件的设置，你没有添加记忆功能。每次我打开软件之前设置过的东西
+// 都会回归默认。"
+//
+// 存档那一层（`ui/Store.kt`）**读过**设置、也**写过**设置，但那个文件 `import
+// android.content.Context`，**编不进** `tools\run-tool-tests.ps1` 那套离线单测
+// （脚本只编固定的八个 .kt 文件）。而"写的顺序 == 读的顺序"这件事恰恰是最需要
+// 离线钉住的一类：这个项目最近往设置行末尾**追加过三段**（`blockSystemGestures`、
+// `showZoomBar`、`confirmReturnToMove`），每一次追加都要同时改"写"和"读"两处 ——
+// 只要有一处 `parts.size > N` 的判据写错，就会出现"某个设置永远读回默认值"
+// 这种**看起来像没存、其实是没读对**的 bug，而它在设备上极难定位。
+//
+// 所以：**字段的个数与顺序只有这一份**（就是下面 [SettingsFields] 的主构造参数顺序），
+// 编码与解码都从它生成。`Store` 只负责"`WatchSettings` ⇄ `SettingsFields`"这一层映射，
+// 它自己不再知道字段顺序。
+//
+// ## 兼容规矩（老存档必须照读）
+//
+//   * 行本身缺失 / 字段数 < 4 → **整组退回默认值**（这是改动前就有的规矩：
+//     连最老的四项都凑不齐，说明这一行不是我们写的）；
+//   * 缺的那几段 → **各自按自己的默认值补**（`parts.size > N` 那一套）——
+//     最老的四段存档到现在仍然读得出来，行为与改动前逐项一致；
+//   * 任何一个字段坏掉（非数字、序号越界）→ 整组退回默认（不拿半截存档去改界面）。
+//
+// ⚠️ **新字段一律追加在末尾**。中间插一个会让老存档的字段整体错位 ——
+// 读出来的就是"网格开关跑到坐标轴上"这种灾难。这条规矩现在由代码结构保证：
+// 追加 = 在主构造参数末尾加一个（并给它一个"老存档缺这一段时"的默认值）。
+// ===================================================================================
+
+/**
+ * 存档里那一行设置的**纯文本编解码**（字段顺序的唯一真相）。
+ *
+ * 字段顺序（就是下面主构造参数的顺序，**不许改**，只能往后追加）：
+ * ```
+ * 0 坐标系序号 | 1 网格 | 2 坐标轴 | 3 坐标数字 | 4 函数示例 | 5 切坐标系要确认 |
+ * 6 度制(DEG) | 7 屏蔽系统手势 | 8 按键缩放栏 | 9 首次用工具"回到移动"提示
+ * ```
+ *
+ * 默认值必须和 `GraphState.WatchSettings` 的默认值**同值**（那边是数据类的默认值，
+ * 这边是"老存档缺这一段"时补的值）。离线单测钉的是**本文件这一份**（写的顺序、
+ * 读的顺序、缺段补齐、坏行退回），两边若漂了，表现是"某项设置读回来是错的默认值"。
+ *
+ * @param coordinateSystem 坐标系的**序号**（`CoordinateSystem.entries` 的下标）。
+ *   这里存序号而不是名字：老存档里就是数字，换成名字会让所有老存档读不出来。
+ * @param degrees 全局度制（true = DEG）。每个函数自己的 `degrees` 在函数行里，不走这里。
+ */
+class SettingsFields(
+    val coordinateSystem: Int = 0,
+    val showGrid: Boolean = true,
+    val showAxes: Boolean = true,
+    val showNumbers: Boolean = false,
+    val showPresets: Boolean = true,
+    val confirmCoordSwitch: Boolean = true,
+    val degrees: Boolean = false,
+    // ---- 以上七段是最老的那一批；以下每一段都是后追加的，缺省值各有各的理由 ----
+    /**
+     * 屏蔽系统手势。**老存档缺这一段时当作"开"**（= 默认值 true）——
+     * 方向和别的布尔项相反是刻意的：这个开关的默认值本来就是"开"，
+     * 老用户升级上来必须继续开着（否则边缘上滑被系统抢走，他会以为"更新把它改坏了"）。
+     */
+    val blockSystemGestures: Boolean = true,
+    /** 按键/滑动条缩放栏。老存档缺这一段 → false（= 不显示，和"默认关"一致）。 */
+    val showZoomBar: Boolean = false,
+    /**
+     * 首次用工具时那条"回到移动"提示还要不要弹。老存档缺这一段 → **true**
+     * （有意的：这一条说明本轮才补上，缺了它老用户会少知道一件事，
+     * 代价只是一次可以勾掉的框）。勾过之后写下去就是 0，永久不再弹。
+     */
+    val confirmReturnToMove: Boolean = true
+) {
+
+    /** 打包成存档里那一行（字段之间用逗号）。 */
+    fun encode(): String = listOf(
+        coordinateSystem.toString(),
+        flag(showGrid),
+        flag(showAxes),
+        flag(showNumbers),
+        flag(showPresets),
+        flag(confirmCoordSwitch),
+        flag(degrees),
+        flag(blockSystemGestures),
+        flag(showZoomBar),
+        flag(confirmReturnToMove)
+    ).joinToString(SEPARATOR)
+
+    companion object {
+
+        /** 存档里的字段分隔符（和函数行的 `|` 不同：设置行里没有一个字段是自由文本）。 */
+        const val SEPARATOR = ","
+
+        /** 字段个数。加一段就 +1（离线单测拿它对拍编码结果）。 */
+        const val FIELD_COUNT = 10
+
+        /** 最老的那一批有几段：连它都凑不齐就整组退回默认。 */
+        private const val OLDEST_FIELD_COUNT = 4
+
+        private fun flag(on: Boolean): String = if (on) "1" else "0"
+
+        /**
+         * 一行存档 → 设置。**绝不抛异常**（坏存档只该退回默认值，不该让 App 起不来）。
+         *
+         * @param line `Store` 里 `KEY_SETTINGS` 那一行；null = 老存档/全新安装。
+         * @param coordinateSystemCount 本版本的 `CoordinateSystem.entries.size`。
+         *   传进来而不是写死：枚举住在 `GraphState.kt`（带 Compose，编不进离线脚本），
+         *   而"序号越界就退回默认"这条规矩必须能离线测到。
+         */
+        fun decode(line: String?, coordinateSystemCount: Int): SettingsFields {
+            val fallback = SettingsFields()
+            val parts = line?.split(SEPARATOR) ?: return fallback
+            if (parts.size < OLDEST_FIELD_COUNT) return fallback
+            val cs = parts[0].toIntOrNull() ?: return fallback
+            if (coordinateSystemCount <= 0 || cs !in 0 until coordinateSystemCount) return fallback
+            return SettingsFields(
+                coordinateSystem = cs,
+                // 前三项在最老的那一批里，一定存在
+                showGrid = parts[1] == "1",
+                showAxes = parts[2] == "1",
+                showNumbers = parts[3] == "1",
+                // ---- 以下每一项都"缺了就用自己的默认值"（老存档照读）----
+                showPresets = boolAt(parts, 4, default = true),
+                confirmCoordSwitch = boolAt(parts, 5, default = true),
+                degrees = boolAt(parts, 6, default = false),
+                blockSystemGestures = boolAt(parts, 7, default = true),
+                showZoomBar = boolAt(parts, 8, default = false),
+                confirmReturnToMove = boolAt(parts, 9, default = true)
+            )
+        }
+
+        /** 第 [index] 段是不是 "1"；这一行没有这一段就用 [default]。 */
+        private fun boolAt(parts: List<String>, index: Int, default: Boolean): Boolean =
+            if (parts.size > index) parts[index] == "1" else default
+    }
+}
+
+/**
+ * 存档里**还有没有东西可读** —— 这一条判据本身就是本轮那个 bug 的修复点。
+ *
+ * ## 真因回顾（一句话）
+ *
+ * `Store.load` 改动前是"函数列表为空 → 整份存档作废"（返回 null），而调用点写的是
+ * `Store.load(context)?.let { … 恢复设置 … }` —— 于是**只要用户一条函数都没有，
+ * 设置就永远读不回来**（切坐标系会清空全部函数、删掉最后一行、清屏都会到这个状态）。
+ * 用户报的"每次打开软件之前设置过的东西都会回归默认"逐字对得上。
+ *
+ * ## 现在的规矩
+ *
+ * **四个键互不依赖**：只要任何一个有值，这份存档就该被读回来。
+ * 函数列表为空只说明"这位用户还没有函数"，不是"这份存档作废"。
+ *
+ * 参数就是四个键"有没有值"（`SharedPreferences.contains` / 字符串非空白），
+ * 抽成纯函数是为了让这条规矩能离线钉住 —— `Store.kt` 里 `import android.content.Context`，
+ * 编不进 `tools\run-tool-tests.ps1` 那一套，而这条规矩恰恰是那一轮 bug 的正中央。
+ */
+fun archiveHasContent(
+    hasFunctions: Boolean,
+    hasSettings: Boolean,
+    hasView: Boolean,
+    hasSliders: Boolean
+): Boolean = hasFunctions || hasSettings || hasView || hasSliders
+
+// ===================================================================================
+// 七、「长按必须留在控件自己的矩形里」—— 出界判定的纯算术
+//
+// ## 用户要求（本轮，全局性）
+//
+// 原话："**还有把所有按钮的长按判定都改成只有在按钮的矩形框内才判定。**"
+// 也就是：手指一旦滑出这个控件**自己的布局矩形**（哪怕只是飘出去），长按就**作废** ——
+// 进度/线圈/闪光**当场复位**、抬手也不再触发那一次长按。
+//
+// ## 为什么这条判据要有名字、要能离线测
+//
+// 它被**四种**长按实现共用（`HoldToConfirm` 的手写手势、`SliderRow` 整行的手写长按、
+// 四行里的 `combinedClickable(onLongClick)`、以及 `WatchIconButton` 的 `onLongClick`），
+// 而"出界"的边界只要在某一处写歪一点（写死一个 dp、或者把容差放大一档），
+// 表现就是"长按有时候算数、有时候不算"—— 真机上几乎没法判断是哪一处。
+// 所以边界本体只有一个纯函数 [pressInsideRect]，调用方一律传**自己节点的实测尺寸**。
+//
+// ## 容差：**有，但极小**（用户："我倾向留一个很小的像素容差…绝不能大到让飘到隔壁键上还能算数"）
+//
+// 完全零容差是**不能**用的：长按要按住 500~900ms，手表上手指又粗，指腹在这段时间里
+// 偏出边界一两个像素是**必然**的（尤其按压时指尖的接触点在滑动）—— 零容差会让
+// "按住 ⚙ 不放"变成一件需要运气的事，而这条功能本身是"按住才生效"的。
+//
+// 所以留 [PRESS_INSIDE_SLACK_FRACTION] = **控件自己短边的 2%**，实算（d2 圆表）：
+//
+// | 控件 | 实测尺寸 | 容差 | 折合 px |
+// |---|---|---|---|
+// | 图标键（⚙ / `+` / 📁 / 🗑） | 41.9 × 29.1dp | 0.58dp | **≈1.2px** |
+// | 函数行色点区（手势区） | 30.3 × 35.0dp | 0.61dp | **≈1.2px** |
+// | 函数行文字区 | ≈157 × 35.0dp | 0.70dp | **≈1.4px** |
+// | 滑动条行 / 对象行 | ≈121~210 × 35.0dp | 0.70dp | **≈1.4px** |
+//
+// 落在用户说的"1~3px"那一档，而且**永远够不到隔壁**：相邻控件的间距最小也有 4dp 以上
+// （工具条两颗键之间 37.3dp、键盘按键之间 ≈4.2dp、色点区与文字区紧挨着 ——
+// 所以**颜色点飘到文字区**这种情形同样会被判成出界 ✔）。
+//
+// 为什么是"占控件自己短边的比例"而不是一个固定 px：固定 px 在 density 1.0 的机型上
+// 会变成"3dp"、在 d3 上又变成"1dp"，同一个控件在不同表上严格程度差三倍；
+// 而"短边的 2%"在任何 density、任何屏形上都折合**同样的物理长度**。
+// ===================================================================================
+
+/**
+ * 长按"出界"判定的**容差**（占控件自己**短边**的比例）。
+ *
+ * 0.02 → 见上面那张表（圆表上折合 ≈1.2~1.4px）。改大它之前请先想清楚
+ * "会不会让手指飘到隔壁键上还算数" —— 那是用户明确禁止的。
+ */
+const val PRESS_INSIDE_SLACK_FRACTION = 0.02f
+
+/**
+ * 手指（控件**本地坐标**）还在这个控件自己的矩形里吗 —— 长按成立的前提。
+ *
+ * 判据就是"点在 `[0, 宽] × [0, 高]` 里（含一个 [PRESS_INSIDE_SLACK_FRACTION] 的小容差）"。
+ *
+ * 非法 / 退化输入一律返回 **true**（= "还算在里"）：**宁可让长按照常成立，
+ * 也不要把用户的长按吞掉** —— 尺寸还没量出来（0×0）的那一帧就是这样，
+ * 判定只是"别误取消"，而真正的边界永远由实测尺寸给。
+ * （这一条和 [sliderPressOnPlayKey] 的取舍方向一致：那边坏坐标也返回"长按能用"。）
+ *
+ * @param xPx / [yPx] 手指位置（控件本地坐标，左沿/上沿 = 0）。
+ * @param widthPx / [heightPx] 这个控件**自己的实测尺寸**（`PointerInputScope.size`）。
+ */
+fun pressInsideRect(xPx: Float, yPx: Float, widthPx: Float, heightPx: Float): Boolean {
+    if (!xPx.isFinite() || !yPx.isFinite()) return true
+    if (!widthPx.isFinite() || !heightPx.isFinite()) return true
+    if (widthPx <= 0f || heightPx <= 0f) return true
+    val slack = minOf(widthPx, heightPx) * PRESS_INSIDE_SLACK_FRACTION
+    return xPx >= -slack && xPx <= widthPx + slack && yPx >= -slack && yPx <= heightPx + slack
 }

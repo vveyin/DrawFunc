@@ -36,11 +36,13 @@ android {
         // 用户原话："每次我说要上传你再更新 versionCode，不然中间太多小版本了，版本号跳跃很快。"
         // 所以**不要**做"每次构建自增"，也不要在小改动里动这两个数：
         //   * 平时改代码 → 保持原样，反复编译出来的包版本号都一样（方便对照、也方便覆盖安装）；
-        //   * 用户说"要上传了" → 才把 versionName 提一档（1.0 → 1.1 …）
-        //     并把 versionCode **加一**（第三方商店要求每次上传的 versionCode 必须比上一版大）。
-        // 现在的首发版本：versionName 1.0 / versionCode 1。
-        versionCode = 1
-        versionName = "1.0"
+        //   * 用户说"要上传了"（或点名要改号）→ 才提一档并把 versionCode **加一**
+        //     （第三方商店要求每次上传的 versionCode 必须比上一版大）。
+        // 历史：1.0 / 1 → **1.0fix / 2**（用户 2026-10-05 点名："把安装包版本号升到 1.0fix，
+        // versioncode 变成 2"）→ **1.1 / 3**（用户 2026-10-05 点名："签名完之后再安装、
+        // 升版本号和 versioncode"，选项里选的是 `1.1 / 3`）。
+        versionCode = 3
+        versionName = "1.1"
     }
 
     // release 签名：密钥路径与口令放在项目根目录的 keystore.properties 里
@@ -57,6 +59,17 @@ android {
                 storePassword = keystoreProps.getProperty("storePassword")
                 keyAlias = keystoreProps.getProperty("keyAlias")
                 keyPassword = keystoreProps.getProperty("keyPassword")
+
+                // ---- 签名方案：v1 + v2 + v3 都要（用户报"安卓 7 装不了"）----
+                // 现象：`apksigner verify` 显示 v1=false / v2=true / v3=false —— 只有 v2。
+                // 为什么只在 Android 7 上出问题：Android 7.0（API 24）才开始支持 v2 方案，
+                // 而**老的安装器/国产 ROM 的包管理器很多会先去验 JAR 签名（v1）**，
+                // v1 缺失时就报"解析软件包时出现问题 / 应用未安装"。
+                // v3 是 Android 9 起的分级签名（key rotation 用），加上它不花钱、兼容性只增不减。
+                // 结论：三个方案同时开启 —— 覆盖 API 24 及以上的所有设备与各家商店的要求。
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
             }
         }
     }

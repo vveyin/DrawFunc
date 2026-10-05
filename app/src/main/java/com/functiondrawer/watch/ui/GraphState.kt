@@ -434,9 +434,9 @@ class GraphState {
         applySettings(next)
         if (next.coordinateSystem != previous.coordinateSystem) {
             clearAllFunctions()
-            // 切坐标系是"故意的清空"，不留撤销条（两类备份都要丢掉）
-            clearedBackup = null
-            clearedSlidersBackup = emptyList()
+            // ⚠️ 这里原来还要把"2 秒撤销条"那两份备份丢掉。本轮那一条**整套删掉**了
+            // （撤销统一走工具条上那对箭头），所以只剩这一句话：切坐标系是"故意的清空"，
+            // 但它照样是一个**有意义的改动**，撤销栈里留着一步（切回去就能把函数要回来）。
             showToast("已切换到${next.coordinateSystem.label}坐标系，原有函数已清空")
         }
     }
@@ -448,51 +448,27 @@ class GraphState {
         applySettings(saved)
     }
 
-    // ---- 清空全部函数（长按 + 触发）----
-
-    /** 清空前的备份，供撤销。 */
-    private var clearedBackup: List<PlotFunction>? = null
-
-    /** 长按 `+` 清空时，滑动条也一起清掉（#3），撤销要一起还回来。 */
-    private var clearedSlidersBackup: List<Slider> = emptyList()
-
-    val canUndoClear: Boolean get() = clearedBackup != null
+    // ---- 清空全部函数（功能界面长按 🗑 触发）----
 
     /**
      * 删掉所有函数。
      *
-     * 这是一个"一下就全没了"的破坏性操作，所以必须留后路：
-     * 备份整份列表，列表底部会浮出撤销条。
+     * 这是一个"一下就全没了"的破坏性操作，所以必须留后路 —— 后路现在只有一条：
+     * **撤销栈**（工具条上左箭头，`pushUndo` 已经把这一步记下来了）。
+     * 原来那份 `clearedBackup` + 底部浮出的 2 秒撤销条在本轮被用户明确要求删掉了。
      */
     fun clearAllFunctions() {
         if (functions.isEmpty() && sliders.isEmpty()) return
-        clearedBackup = functions
-        clearedSlidersBackup = sliders
+        // 撤销点：在**改动之前**拍一张快照（含函数 / 滑动条 / 绑定表 / 对称规则），
+        // 所以撤销那一下会把它们一起还回来 —— 不再需要旁边再留一份"清空备份"。
+        pushUndo("清空全部")
         functions = emptyList()
         sliders = emptyList()
         // 清空全部 = 连"哪条函数里哪个字母指谁"也一起清掉（函数都没了，那张表没有意义）。
-        // 撤销时**不恢复**绑定表：撤销条只把函数找回来，用户重新在编辑器里指认一次
-        // （比"撤销之后偷偷恢复一张看不见的表"更好理解 —— 表是用户点出来的，可重复）。
+        // 注意撤销时这张表会**跟着快照一起回来**（本轮起它进了快照），
+        // 所以"撤销之后绑定表偷偷变了"这件事不存在 —— 它就是当时的那个样子。
         functionBindings = emptyMap()
         selectedId = -1L
-        // 撤销条一次只撤最近一次破坏性操作：清空全部把其它几路的备份也一起丢掉
-        // （滑动条这一路是随 #3 的"滑动条行也能左滑删除"一起加的，见 `removeSlider`）。
-        lastDeleted = null
-        lastDeletedSlider = null
-    }
-
-    fun undoClearAll() {
-        val backup = clearedBackup ?: return
-        functions = backup
-        sliders = clearedSlidersBackup
-        selectedId = backup.firstOrNull()?.id ?: -1L
-        clearedBackup = null
-        clearedSlidersBackup = emptyList()
-    }
-
-    /** 撤销条超时后调用：丢掉清空备份。 */
-    fun forgetCleared() {
-        clearedBackup = null
     }
 
     // ---- 新建但还没真正保存的函数 ----
@@ -508,6 +484,9 @@ class GraphState {
 
     fun markJustCreated(id: Long) {
         justCreatedId = id
+        // 把"新建"那一步的步骤号认成这条草稿的：草稿被丢弃时一起作废
+        // （见 [draftUndoStepId] 的说明）。
+        draftUndoStepId = lastAddUndoStepId
     }
 
     fun clearJustCreated() {
@@ -516,9 +495,16 @@ class GraphState {
 
     /** 丢弃一个还没真正保存的函数：**不产生撤销记录**（它本来就不该存在）。 */
     fun discardFunction(id: Long) {
+        // 这条草稿的"新建 + 之后每一次编辑"那几步撤销点一起作废：
+        // 它们记的都是"这条草稿还不存在"的世界，留着就会出现
+        // "按一次撤销，被丢掉的空函数又回来了"（详见 [draftUndoStepId]）。
+        // 只对**刚新建的那一条**这么做：用户自己建的已有函数从来不在射程内。
+        val step = draftUndoStepId.takeIf { justCreatedId == id }
+        if (step != null) dropUndoStepsFrom(step)
         functions = functions.filterNot { it.id == id }
         if (selectedId == id) selectedId = functions.firstOrNull()?.id ?: -1L
         if (justCreatedId == id) justCreatedId = null
+        if (draftUndoStepId == step) draftUndoStepId = null
     }
 
     /**
@@ -1004,7 +990,23 @@ class GraphState {
         plot = result
     }
 
-    /** 从存档恢复。 */
+    /**
+     * 从存档恢复。
+     *
+     * ## 函数列表**可以为空**（本轮「设置没被记住」那个 bug 的收尾）
+     *
+     * 存档里一条函数都没有不是"这份存档作废"，而是"这位用户确实还没有函数"
+     * （切坐标系会清空全部函数、删掉最后一行、清屏都会到这个状态）。
+     * 上一版这里写的是 `if (functions.isEmpty()) return`，而调用点外面那句
+     * `Store.load(context)?.let { … }` 曾经也把整份存档丢掉了 —— 修完 `Store.load`
+     * 之后，这一句仍然是"设置回来了、视野却被跳过"的最后一个缺口。
+     *
+     * 所以现在：**空表时只恢复视野**，不动函数列表（内存里那份还是新建时的默认示例，
+     * 行为与改动前一致 —— 用户不会因为"存档是空的"而丢掉 App 的初始示例）。
+     *
+     * 视野的合法性再判一次：`unitsPerPixel` 坏掉时宁可继续用默认视野，
+     * 也不能把 NaN 塞进 `Viewport`（那会让整块画布算不出任何像素）。
+     */
     fun restore(
         functions: List<PlotFunction>,
         selectedId: Long,
@@ -1012,12 +1014,16 @@ class GraphState {
         centerY: Double,
         unitsPerPixel: Double
     ) {
-        if (functions.isEmpty()) return
-        this.functions = functions
-        this.selectedId = if (functions.any { it.id == selectedId }) selectedId else functions.first().id
-        idSeq = functions.maxOf { it.id }
-        viewport = Viewport(0f, 0f, centerX, centerY, unitsPerPixel)
-        pendingRestore = true
+        if (functions.isNotEmpty()) {
+            this.functions = functions
+            this.selectedId =
+                if (functions.any { it.id == selectedId }) selectedId else functions.first().id
+            idSeq = functions.maxOf { it.id }
+        }
+        if (unitsPerPixel.isFinite() && unitsPerPixel > Viewport.MIN_UNITS_PER_PIXEL) {
+            viewport = Viewport(0f, 0f, centerX, centerY, unitsPerPixel)
+            pendingRestore = true
+        }
     }
 
     /**
@@ -1089,6 +1095,10 @@ class GraphState {
         get() = functions.firstOrNull { it.id == selectedId } ?: functions.firstOrNull()
 
     fun addFunction(mode: PlotMode = PlotMode.EXPLICIT, src1: String = "", src2: String = ""): Long {
+        // 撤销点：加之前先拍快照（"撤销：新建函数"撤掉的就是这一条）。
+        // 步骤号留给 [markJustCreated]：`+` 那条路建出来的是一条**草稿**，
+        // 草稿被丢弃时这一步（连同它之后的编辑步骤）要一起作废。
+        lastAddUndoStepId = pushUndo("新建函数")
         val id = nextId()
         val fn = PlotFunction(
             id = id,
@@ -1274,8 +1284,21 @@ class GraphState {
         }
     }
 
+    /** 换一条滑动条的内容，**不产生撤销点**（拖值 / 播放每帧都会调它，见 [editSlider]）。 */
     fun updateSlider(s: Slider) {
         sliders = sliders.map { if (it.id == s.id) s else it }
+    }
+
+    /**
+     * 改滑动条的**属性**（属性屏里改名字 / 下界 / 上界 / 步长）。
+     *
+     * 和 [updateSlider] 分开的理由只有一条：拖值（[setSliderValue]，手指每动一帧调一次）
+     * 绝不能压撤销点 —— 那会把 20 步历史在一秒之内冲干净。属性屏的改动才算一步
+     * （tag 相同 = 同一个属性上连打字只算一步，机制见 [pushUndo]）。
+     */
+    fun editSlider(s: Slider) {
+        pushUndo("编辑滑动条 ${s.param}", tag = "slider:${s.id}")
+        updateSlider(s)
     }
 
     fun setSliderValue(id: Long, value: Double) {
@@ -1299,59 +1322,28 @@ class GraphState {
         if (sliders.any { it.playing }) sliders = sliders.map { it.copy(playing = false) }
     }
 
-    /** 刚被滑掉的那条滑动条（撤销用）。 */
-    data class DeletedSlider(val index: Int, val slider: Slider)
-
     /**
-     * 被左滑删掉的滑动条，用来给一个"撤销"机会。
+     * 删掉一条滑动条（列表里左滑）—— 和删函数 / 删对象一样留撤销后路。
      *
-     * 和 [lastDeleted]（函数）/ [lastDeletedObject]（几何对象）**同一条规矩**：
-     * 手势删除没有二次确认，所以底部浮出一条 2 秒的「已删除 · 点此撤销」。
-     * 备份的是**整个 [Slider]** —— 参数字母、上下界、步长、当前值、颜色、显隐、
-     * 是否在播放全在里面，所以撤销之后它回到**原来的位置、原来的取值、原来的名字**，
-     * 而不是一条被重置成默认 -5~5 的新滑动条。
+     * 后路**只有一条**：撤销栈（工具条上那对箭头）。本轮起这里压的是**整份快照**
+     * （滑动条 / 函数 / 几何对象 / 绑定表 / 对称规则全在里面），所以撤销之后那条滑动条
+     * 回到**原来的位置、原来的取值、原来的名字**，而不是一条被重置成默认 -5~5 的新滑动条。
+     * （原来还要另外存一份 `lastDeletedSlider` 给底部那条 2 秒撤销条用 —— 用户本轮
+     * 明确要求把那些撤销提示全部删掉，所以那份备份也一起删了。）
      *
-     * ⚠️ 这份备份必须在 `GraphScreen` 那个 2 秒到期的 effect 的 key 里，
-     * 并由它调 [forgetDeletedSlider] —— 漏一路的后果不是"消失得慢"，
-     * 而是"撤销条永不消失、还会把两笔删除混在一起"（几何对象那一路真机踩过一次）。
-     */
-    var lastDeletedSlider by mutableStateOf<DeletedSlider?>(null)
-        private set
-
-    /**
-     * 删掉一条滑动条（列表里左滑）—— 和删函数 / 删对象一样留一条撤销后路。
-     *
-     * 撤销条本身仍然由界面那一层根据"有没有备份"决定显隐，这里只负责记账。
      * 被删的参数值不再参与采样（`sliders` 进的是 `GraphScreen` 那条采样 effect 的 key），
      * 所以删掉/撤销都会重采样，曲线跟着变 —— 和删函数、删对象逐项一致。
      */
     fun removeSlider(id: Long) {
         val index = sliders.indexOfFirst { it.id == id }
         if (index < 0) return
-        lastDeletedSlider = DeletedSlider(index, sliders[index])
+        val name = sliders[index].param
+        // 撤销点必须在**改之前**压（快照记的是"这条还在"的那个状态）
+        pushUndo("删除滑动条 $name")
         sliders = sliders.filterNot { it.id == id }
-        // 撤销条一次只撤**最近一次**破坏性操作（和 `removeObject` / `clearObjects`
-        // 同一条纪律）：其余几路的备份一起丢掉，否则会出现"先删滑动条、再删函数，
-        // 点撤销撤掉的是滑动条"——那种"撤错东西"的坑几何对象那一路真机踩过一次。
-        lastDeleted = null
-        clearedBackup = null
-        lastDeletedObject = null
-        clearedObjectsBackup = null
-    }
-
-    /** 撤销上面那一次：把整条滑动条按原位置、原取值放回去。 */
-    fun undoDeleteSlider() {
-        val d = lastDeletedSlider ?: return
-        val at = d.index.coerceIn(0, sliders.size)
-        sliders = sliders.toMutableList().apply { add(at, d.slider) }
-        lastDeletedSlider = null
-        // 参数值回来了 → 采样要重跑。这一句**不用写**：`GraphScreen` 那条采样 effect 的
-        // key 里有 `sliders`（和删函数/删对象是同一条管线），状态一变它自己会重算。
-    }
-
-    /** 撤销条超时后调用：丢掉滑动条那份备份（三路备份必须一起过期）。 */
-    fun forgetDeletedSlider() {
-        lastDeletedSlider = null
+        // 删掉了什么要说一句（原来这句话是底部那条 2 秒撤销条承担的；撤销条删掉之后
+        // 改成一条**纯提示**的 toast：它不可点、也不再出现"点此撤销"这类字样）。
+        showToast("已删除滑动条 $name")
     }
 
     fun clearSliders() {
@@ -1502,16 +1494,282 @@ class GraphState {
         toast = null
     }
 
+    // ===================================================================================
+    // 快照式撤销 / 重做（本轮新增 —— 工具条上"横着滑一下"唤出的那一对箭头）
+    //
+    // ## 用户要的是什么
+    //
+    // 原话："给这个软件加一个撤销的功能，在函数列表界面，从设置滑到加号。按键可以在设置和
+    // 加号那一条的地方显示出撤销菜单有左箭头和右箭头。……从加号滑到设置和从删除滑到文件夹，
+    // 也可以调出来撤销按钮。注意添加丰富美观的动画。"
+    //
+    // 界面那一半在 `Common.kt`（`rememberToolbarUndoMenu` + `ToolbarUndoRedoMenu`，
+    // 两屏共用）与两屏的调用点；**历史本身在这里** ——
+    // 界面只问四件事：[canUndo] / [canRedo] / [undo] / [redo]。
+    //
+    // ## 模型：压"改动之前的整份内容"，而不是记"改了什么"
+    //
+    // 记 delta（"删了第 3 行"）在手表这种小状态上不划算：要对每一种改动各写一份逆操作，
+    // 少写一种就是"某一类操作撤不回去"的静默 bug。这里反过来 —— 在改动**之前**拍一张
+    // 快照（[UndoStep]），撤销 = 把快照整体装回去。好处是**新增一种改动只要加一句
+    // `pushUndo`**，撤销/重做的代码一行都不用动。
+    //
+    // 代价是内存。这一条要说实话：一份 [UndoStep] 里存的是**几个 list 的引用**
+    // （函数 / 滑动条 / 几何对象 / 绑定表 / 对称规则），元素本身是共享的不可变数据类，
+    // 所以每一步的额外开销只是"几个 list 头 + 几个标量"——
+    // 量级是 **几十~几百字节**（`functions` 那份 list 是 `map/filter` 出来的新数组，
+    // 100 条函数时约 100 × 8B = 800B）。20 步上限合计在 **几十 KB** 量级，
+    // 对手表上这个规模的 App 完全不构成压力。
+    // 上限取 [UNDO_STACK_LIMIT] = 20 的真正理由是**可预期**：用户在手表上按左箭头，
+    // 心里记的是"刚才那几步"；栈太深（比如 200）只会让"一直按回去"变成一件失控的事。
+    //
+    // ## 哪些东西进栈、哪些**不进**（刻意的取舍）
+    //
+    // | | 进栈吗 | 为什么 |
+    // |---|---|---|
+    // | 函数 / 方程 | ✅ | 用户画出来的东西 |
+    // | 滑动条 | ✅ | 同上（含它的下界/上界/步长/名字） |
+    // | 几何对象（点/线/度量） | ✅ | 同上 |
+    // | 名字绑定表 `functionBindings` | ✅ | 它是"这个字母指谁"，属于用户点的内容 |
+    // | 曲线对称规则 `transformedCurves` | ✅ | 不带上它，撤销"清屏"之后对称曲线不会回来 |
+    // | **设置**（坐标系 / 网格 / 坐标轴 / 数字 / 示例 / 手势开关 / 缩放栏） | ❌ | 用户明确不希望"撤销把刚设好的坐标系改回去"这种惊吓；而且切坐标系会清空函数，撤销回去会出现"函数和坐标系对不上"这一对不兼容的状态。设置页本来就有自己的草稿 + 确认框机制 |
+    // | **视野**（缩放 / 平移） | ❌ | 它每帧都在变（手势、表冠），进栈会把历史冲干净；而"撤销一次图跳回上一处"不是用户按撤销时想要的东西 |
+    // | **选中项 `selectedId`** | ⚠️ 随快照一起还回去 | 它决定列表里哪一条高亮、"编辑哪一条"，跟着内容回到当时的样子最自然；[applyUndoStep] 里还会校验它仍然指向存在的函数 |
+    //
+    // ## 撤销只有这一条路（本轮起：旧的「2 秒撤销条」整条删掉了）
+    //
+    // 用户本轮原话："这样子就要把所有的撤销的 toast 提示都给删掉。"
+    // 于是原来那套 `lastDeleted` / `lastDeletedObject` / `lastDeletedSlider` /
+    // `clearedBackup` / `clearedObjectsBackup`（以及 `GraphScreen` 里那个 2 秒到期 effect、
+    // 第一屏底部那条「已删除 · 点此撤销」胶囊）**全部删除**：
+    //   * 删除动作（函数 / 滑动条 / 几何对象 / 清屏 / 清空全部）现在只做两件事 ——
+    //     在改动**之前** `pushUndo(...)` 记一步（这样撤销菜单能把它撤回来）、
+    //     再弹一条**纯提示**的 toast（"已删除 a(x)"，不可点、不含任何"点此撤销"字样）；
+    //   * 界面侧只有一个入口：[canUndo] / [canRedo] / [undo] / [redo]
+    //     （工具条上那对箭头键）。
+    // 好处不只是"少一套 UI"：**只留一个历史源**，"两套各撤各的"这类打架从结构上消失了
+    // （原来还要靠 `undoStepId` 对齐、靠"撤一次就清空旧备份"防重复撤销）。
+    //
+    // ## 进栈 / 不进栈（刻意的取舍，一个字没变）
+    //
+    // | | 进栈吗 | 为什么 |
+    // |---|---|---|
+    // | 函数 / 方程 | ✅ | 用户画出来的东西 |
+    // | 滑动条 | ✅ | 同上（含它的下界/上界/步长/名字） |
+    // | 几何对象（点/线/度量） | ✅ | 同上 |
+    // | 名字绑定表 `functionBindings` | ✅ | 它是"这个字母指谁"，属于用户点的内容 |
+    // | 曲线对称规则 `transformedCurves` | ✅ | 不带上它，撤销"清屏"之后对称曲线不会回来 |
+    // | **设置**（坐标系 / 网格 / 坐标轴 / 数字 / 示例 / 手势开关 / 缩放栏） | ❌ | 用户明确不希望"撤销把刚设好的坐标系改回去"这种惊吓；而且切坐标系会清空函数，撤销回去会出现"函数和坐标系对不上"这一对不兼容的状态。设置页本来就有自己的草稿 + 确认框机制 |
+    // | **视野**（缩放 / 平移） | ❌ | 它每帧都在变（手势、表冠），进栈会把历史冲干净；而"撤销一次图跳回上一处"不是用户按撤销时想要的东西 |
+    // | **选中项 `selectedId`** | ⚠️ 随快照一起还回去 | 它决定列表里哪一条高亮、"编辑哪一条"，跟着内容回到当时的样子最自然；[applyUndoStep] 里还会校验它仍然指向存在的函数 |
+    // ===================================================================================
+
+    /**
+     * 一步"可以回去的状态"。
+     *
+     * `private` 是刻意的：快照的形状只该由状态层自己决定（外面拿不到、也就不会有人
+     * 试图在外面拼一个"半个快照"塞进来）。
+     */
+    private class UndoStep(
+        /** 这一步是**什么改动**（toast 文案用，例如"删除 a(x)"）。 */
+        val label: String,
+        /** 单调递增的步骤号：用来"作废某一步及其之后压进来的全部步骤"（见 [dropUndoStepsFrom]）。 */
+        val stepId: Long,
+        val functions: List<PlotFunction>,
+        val sliders: List<Slider>,
+        val objects: List<GraphObject>,
+        val selectedId: Long,
+        val functionBindings: Map<Long, Map<String, Long>>,
+        val transformedCurves: List<TransformedCurve>
+    )
+
+    private val undoStack = ArrayDeque<UndoStep>()
+    private val redoStack = ArrayDeque<UndoStep>()
+    private var undoStepSeq = 0L
+
+    /**
+     * 上一串"同一类连续改动"的标记（[pushUndo] 的 `tag`）。
+     *
+     * `null` = 下一步一定要压。任何 **tag 不同**的改动、以及任何一次撤/重做
+     * （还有 [endUndoGroup]）都会把它清掉 —— 于是"同一类"只可能在**紧挨着的、
+     * 没有任何别的动作插进来**的一串调用里成立，这正是"在编辑器里连打十个字算一步"。
+     */
+    private var lastUndoTag: String? = null
+
+    /**
+     * "新建函数"那一步的步骤号（草稿被丢弃时要连同它之后压的步骤一起作废）。
+     *
+     * 为什么需要它：`+` 是"先建一条空函数再进编辑器"的，用户在编辑器里打的每个字
+     * 都会压一步（同一个 tag 只压第一步）。如果最后什么都没输入、这条草稿被丢掉
+     * （[discardFunction]），那几步记的都是"这条草稿还不存在"的世界 ——
+     * 留着它们，用户按一次撤销就会把**已经被丢掉的空函数**变回来。
+     */
+    private var draftUndoStepId: Long? = null
+
+    /** `addFunction` 最近压的那一步（`markJustCreated` 会把它认成"草稿的那一步"）。 */
+    private var lastAddUndoStepId: Long? = null
+
+    /** 还能撤销吗（工具条上左箭头亮不亮）。 */
+    val canUndo: Boolean get() = undoStack.isNotEmpty()
+
+    /** 还能重做吗（右箭头亮不亮）。 */
+    val canRedo: Boolean get() = redoStack.isNotEmpty()
+
+    /** 当前状态的快照。 */
+    private fun snapshot(label: String, stepId: Long): UndoStep = UndoStep(
+        label = label,
+        stepId = stepId,
+        functions = functions,
+        sliders = sliders,
+        objects = objects,
+        selectedId = selectedId,
+        functionBindings = functionBindings,
+        transformedCurves = transformedCurves.toList()
+    )
+
+    /**
+     * 在**一次有意义的改动之前**拍一张快照。
+     *
+     * @param label toast 文案（"删除 a(x)"这种，用户看得懂的词）。
+     * @param tag 非空 = "同一类连续改动"的标记（例如 `edit:5` = 第 5 条函数的编辑）。
+     *   栈顶那一步的 tag 与它相同就**不再压** —— 那一步记的本来就是"这一串改动之前"
+     *   的状态，于是"连打十个字"只算一步撤销。
+     * @return 这一步的步骤号（草稿作废时要用，见 [draftUndoStepId]）。
+     */
+    private fun pushUndo(label: String, tag: String? = null): Long {
+        val top = undoStack.lastOrNull()
+        if (tag != null && top != null && tag == lastUndoTag) return top.stepId
+        val id = ++undoStepSeq
+        undoStack.addLast(snapshot(label, id))
+        // 上限：超出就丢**最老**的那一步（用户按左箭头是按回"刚才"，不是按回"刚装好"）
+        while (undoStack.size > UNDO_STACK_LIMIT) undoStack.removeFirst()
+        // 新改动 → 重做栈作废（这是"重做"语义的全部）
+        redoStack.clear()
+        lastUndoTag = tag
+        return id
+    }
+
+    /**
+     * 丢掉 [stepId] 及其之后压进来的每一步 —— "这一串改动整个作废了"。
+     *
+     * 唯一的调用点是 [discardFunction]（见 [draftUndoStepId] 的说明）。
+     */
+    private fun dropUndoStepsFrom(stepId: Long) {
+        while (undoStack.isNotEmpty() && undoStack.last().stepId >= stepId) undoStack.removeLast()
+        redoStack.clear()
+        lastUndoTag = null
+        if ((draftUndoStepId ?: -1L) >= stepId) draftUndoStepId = null
+    }
+
+    /**
+     * 一串"连续改动"到此为止：下一个同类改动算**新的一步**。
+     *
+     * 由界面在**路由变化**时调一次（`GraphScreen` 里那个 `LaunchedEffect(state.route)`）。
+     * 不调会怎样：进编辑器改一下、退出来、再进去改一下 —— 两次编辑会被算成同一步撤销
+     * （因为 tag 都是 `edit:<同一个 id>`），撤销一次把两回的改动一起撤掉。
+     */
+    fun endUndoGroup() {
+        lastUndoTag = null
+    }
+
+    /**
+     * 撤销一步。
+     *
+     * @return 撤掉的是哪一步（界面拿它拼 toast「已撤销：删除 a(x)」）；
+     *   **栈空时返回 null**（界面据此弹「没有可撤销的操作」）。
+     */
+    fun undo(): String? {
+        val step = undoStack.removeLastOrNull() ?: return null
+        // 当前状态进重做栈：它记的是"这一步之后的样子"，重做就是把这一步再做一遍。
+        // ⚠️ 这里**不做** `redoStack.clear()` —— 那会让重做永远不可能。
+        redoStack.addLast(snapshot(step.label, step.stepId))
+        while (redoStack.size > UNDO_STACK_LIMIT) redoStack.removeFirst()
+        applyUndoStep(step)
+        lastUndoTag = null
+        draftUndoStepId = null
+        return step.label
+    }
+
+    /** 重做一步（[undo] 的逆）。@return 重做的是哪一步；栈空返回 null。 */
+    fun redo(): String? {
+        val step = redoStack.removeLastOrNull() ?: return null
+        undoStack.addLast(snapshot(step.label, step.stepId))
+        while (undoStack.size > UNDO_STACK_LIMIT) undoStack.removeFirst()
+        applyUndoStep(step)
+        lastUndoTag = null
+        draftUndoStepId = null
+        return step.label
+    }
+
+    /** 把一份快照整体装回去（撤销与重做**共用**这一段，所以两者永远是对称的）。 */
+    private fun applyUndoStep(step: UndoStep) {
+        functions = step.functions
+        // 播放状态**不跟着快照回来**（和 `Store` 那条"播放状态不落库：重启之后不该自己
+        // 动起来"是同一条约定）：撤销一步之后某条滑动条自己跑起来会非常莫名其妙。
+        sliders = if (step.sliders.any { it.playing }) {
+            step.sliders.map { it.copy(playing = false) }
+        } else {
+            step.sliders
+        }
+        objects = step.objects
+        selectedId = if (step.functions.any { it.id == step.selectedId }) {
+            step.selectedId
+        } else {
+            step.functions.firstOrNull()?.id ?: -1L
+        }
+        functionBindings = step.functionBindings
+        // 对称曲线的**规则**也一起回去（不回去的话，"撤销清屏"之后那些对称曲线不会重画）
+        transformedCurves.clear()
+        transformedCurves += step.transformedCurves
+        // ⚠️ `idSeq` **绝不回退**：函数 / 滑动条 / 几何对象的 id 是全局唯一、永不复用的，
+        // 回退会让"撤销之后新建的东西"拿到一个出现过的 id（列表 key 撞车、
+        // 名字绑定表串到别人身上）。所以撤销只换内容，号段继续往前走。
+        //
+        // 顺手收掉"点中的卡片"：它可能正指着刚刚被撤掉的那个对象
+        // （不收就会出现一张浮在图上、指向不存在对象的卡片）。
+        clearTappedCards()
+        // （原来这里还要把五路"2 秒撤销条"的备份清干净 —— 那一条本轮整套删掉了，
+        //   撤销现在**只有这一个历史源**，"两套各撤各的"从结构上不可能发生。）
+        // 采样 / 列表都不用手动刷新：它们读的就是这几个状态。
+        // `GraphScreen` 那条采样 effect 的 key 里有 functions / sliders / objects，
+        // 状态一变它自己会重算 —— 和删函数、打开文件走的是同一条管线。
+    }
+
     // ---- 改颜色 ----
 
     fun setColor(id: Long, colorIndex: Int) {
         functions.firstOrNull { it.id == id }?.let { fn ->
-            updateFunction(fn.copy(colorIndex = colorIndex))
+            pushUndo("${fn.title()} 换颜色", tag = "color:$id")
+            updateFunctionNoUndo(fn.copy(colorIndex = colorIndex))
         }
     }
 
+    /**
+     * 改一条函数。编辑器里**每敲一个字**都会调它（边打边看），所以：
+     * 撤销点在这里压，但**同一串编辑只压第一步**（tag = `edit:<id>`，见 [pushUndo]）。
+     */
     fun updateFunction(fn: PlotFunction) {
+        pushUndo("编辑 ${fn.title()}", tag = "edit:${fn.id}")
+        updateFunctionNoUndo(fn)
+    }
+
+    /** 换一条函数的**内容**，不产生撤销点（给已经自己压过一步的调用方用）。 */
+    private fun updateFunctionNoUndo(fn: PlotFunction) {
         functions = functions.map { if (it.id == fn.id) fn else it }
+    }
+
+    /**
+     * 切一条函数的显隐（列表里点色点）。
+     *
+     * 单独开一个方法而不是让界面直接 `updateFunction(fn.copy(visible = …))`：
+     * 那样压出来的撤销点 tag 是 `edit:<id>`，会和"正在编辑器里打字"那一串合并；
+     * 而"点了色点"和"改了表达式"在用户心里是两件事。
+     */
+    fun setVisible(id: Long, visible: Boolean) {
+        functions.firstOrNull { it.id == id }?.let { fn ->
+            pushUndo("${fn.title()} 改显隐", tag = "visible:$id")
+            updateFunctionNoUndo(fn.copy(visible = visible))
+        }
     }
 
     // ---- 角度单位（**每个函数各一份**）----
@@ -1550,44 +1808,32 @@ class GraphState {
         updateFunction(converted.copy(degrees = toDegrees))
     }
 
-    // ---- 删除与撤销 ----
+    // ---- 删除（撤销统一走工具条上那对箭头，见文件上方"快照式撤销 / 重做"那一节）----
 
     /**
-     * 刚被滑掉的那个函数，用来给一个"撤销"机会。
+     * 删掉一个函数（列表里左滑）。
      *
-     * 手势删除是**没有二次确认**的（手表上弹确认框比误删还烦），
-     * 所以必须留一条后路：删掉之后底部浮出一个小条，点一下就能撤回。
+     * 手势删除是**没有二次确认**的（手表上弹确认框比误删还烦），所以必须留后路 ——
+     * 后路现在只有一条：**撤销栈**（`pushUndo` 在改动之前压的那一步，用左箭头撤回来）。
+     * 原来那份 `lastDeleted` 备份 + 底部 2 秒撤销条在本轮被用户要求删掉了。
      */
-    data class Deleted(val index: Int, val function: PlotFunction)
-
-    var lastDeleted by mutableStateOf<Deleted?>(null)
-        private set
-
-    fun undoDelete() {
-        val d = lastDeleted ?: return
-        val at = d.index.coerceIn(0, functions.size)
-        functions = functions.toMutableList().apply { add(at, d.function) }
-        selectedId = d.function.id
-        lastDeleted = null
-    }
-
-    fun forgetDeleted() {
-        lastDeleted = null
-    }
-
     fun removeFunction(id: Long) {
         val index = functions.indexOfFirst { it.id == id }
-        if (index >= 0) lastDeleted = Deleted(index, functions[index])
+        if (index < 0) return
+        val name = functions[index].title()
+        // 撤销点必须在**改之前**压（快照记的是"这条还在"的那个状态）
+        pushUndo("删除 $name")
         functions = functions.filterNot { it.id == id }
-        // 撤销条一次只撤最近一次操作：把滑动条那一路的备份丢掉
-        // （否则"先删滑动条、再删函数"之后，撤销条会指向很久以前那条滑动条）。
-        lastDeletedSlider = null
         // 名字绑定表跟着函数一起走：这条函数没了，它那份"字母指谁"就没有意义了。
-        // （id 是全局递增、永不复用，所以留着也不会串到别的函数上；清掉只是不让它变成垃圾。）
+        // （id 是全局递增、永不复用，所以留着也不会串到别的函数上；清掉只是不让它变成垃圾。
+        //  撤销时这张表会**跟着快照一起回来** —— 本轮起它进了快照。）
         if (functionBindings.containsKey(id)) functionBindings = functionBindings - id
         if (selectedId == id) {
             selectedId = functions.firstOrNull()?.id ?: -1L
         }
+        // 删掉了什么要说一句（原来是底部那条 2 秒撤销条承担的；现在是一条**纯提示**的
+        // toast：不可点、不含"点此撤销"这类字样）。
+        showToast("已删除 $name")
     }
 
     fun errorOf(id: Long): String? = plot.errors[id]
@@ -1914,16 +2160,13 @@ class GraphState {
             pendingRestore = true
         }
 
-        // 各种"撤销后路"和半截会话一概清掉：它们记的是**上一份内容**的下标/对象，
-        // 装载之后引用已经对不上了（点撤销会插回一个不属于这个文件的东西）。
-        clearedBackup = null
-        clearedSlidersBackup = emptyList()
-        clearedObjectsBackup = null
-        lastDeleted = null
-        lastDeletedObject = null
-        // 滑动条那一路也是"上一份内容"的备份（`removeSlider` 存的下标），
-        // 装完文件之后它同样对不上 —— 一起清掉（三个 `lastDeleted*` 一个都不能漏）。
-        lastDeletedSlider = null
+        // 半截会话一概清掉：它们记的是**上一份内容**的下标/对象，装载之后引用已经对不上了。
+        //
+        // ⚠️ 这里原来是"五路撤销备份"清一遍（`clearedBackup` / `lastDeleted*` …）——
+        // 那些备份本轮**整套删掉**了，所以现在只剩下面这两句"半截会话"。
+        // 历史栈（`undoStack`）**故意不清**：打开一个文件本身不是"一次改动"，
+        // 撤一下应该回到打开文件**之前**那一屏内容（那是用户按撤销时想要的），
+        // 而快照里存的是**内容列表**而不是下标，所以跨文件也不会插错东西。
         justCreatedId = null
         tappedId = null
         // 名字绑定表：**从文件里恢复**（`snapshotForFile` 写的那一份）。
@@ -2138,15 +2381,26 @@ class GraphState {
     fun objectById(id: Long): GraphObject? = objects.firstOrNull { it.id == id }
 
     fun addObject(o: GraphObject) {
+        // 撤销点：一次工具动作 = 一步。
+        //
+        // ⚠️ **对称曲线的折线碎片不压**（`role == FRAGMENT_ROLE`）：一条曲线的对称结果是
+        // 几十上百段 `GraphLineObject`，而且每次重采样都会整批重建
+        // （`rebuildTransformedCurves` → `emitFragment` → 这里）。给它们压撤销点，
+        // 20 步的上限会被一次变换冲干净，"撤销"从此撤不到任何用户认得的东西。
+        // 碎片本身仍然在快照里（`objects` 一起被记下），只是不单独占一步。
+        val isFragment = o is GraphLineObject && o.role == FRAGMENT_ROLE
+        if (!isFragment) pushUndo("绘制 ${o.name}")
         objects = objects + o
     }
 
+    /** 原地改一个对象，**不产生撤销点**（给已经自己压过一步的调用方用）。 */
     fun updateObject(o: GraphObject) {
         objects = objects.map { if (it.id == o.id) o else it }
     }
 
     fun setObjectColor(id: Long, colorIndex: Int) {
         objects.firstOrNull { it.id == id }?.let {
+            pushUndo("${it.name} 换颜色", tag = "objcolor:$id")
             updateObject(
                 when (it) {
                     is GraphPointObject -> it.copy(colorIndex = colorIndex)
@@ -2159,6 +2413,7 @@ class GraphState {
 
     fun toggleObjectVisible(id: Long) {
         objects.firstOrNull { it.id == id }?.let {
+            pushUndo("${it.name} 改显隐", tag = "objvisible:$id")
             updateObject(
                 when (it) {
                     is GraphPointObject -> it.copy(visible = !it.visible)
@@ -2176,6 +2431,7 @@ class GraphState {
      */
     fun toggleObjectShowValue(id: Long) {
         val m = objects.firstOrNull { it.id == id } as? GraphMeasureObject ?: return
+        pushUndo("${m.name} 改数值显示", tag = "objvalue:$id")
         updateObject(m.copy(showValue = !m.showValue))
     }
 
@@ -2272,6 +2528,9 @@ class GraphState {
         if (o.name == newName) return true
         // taken 里**不含** o.name 自己：否则"点进去直接退出"也会被报成重名。
         if (objectNameError(o, newName, takenObjectNames(id)) != null) return false
+        // 撤销点：校验都过了、确实要改，才压这一步（不然"改了个非法名字"也会占一步撤销，
+        // 而用户按撤销时会发现什么都没变）。tag = 同一个对象的改名连打字只算一步。
+        pushUndo("${o.name} 改名为 $newName", tag = "rename:$id")
         val old = o.name
         val renamed = when (o) {
             is GraphPointObject -> o.copy(name = newName)
@@ -2300,22 +2559,21 @@ class GraphState {
     }
 
     /**
-     * 删除一个几何对象（列表里左滑）。和删函数一样留一条撤销后路。
+     * 删除一个几何对象（列表里左滑）。和删函数一样：后路只有撤销栈那一条。
      */
     fun removeObject(id: Long) {
         val index = objects.indexOfFirst { it.id == id }
         if (index < 0) return
-        lastDeletedObject = DeletedObject(index, objects[index])
+        val name = objects[index].name
+        // 撤销点必须在**改之前**压（快照记的是"这个对象还在"的那个状态）
+        pushUndo("删除 $name")
         objects = objects.filterNot { it.id == id }
-        lastDeleted = null
-        // 滑动条那一路的备份一起丢（同一条"一次只撤最近一次"的纪律，见 `removeSlider`）
-        lastDeletedSlider = null
         // 被删的正好是属性卡上那一个 → 把"点中的是谁"也清掉
         // （卡片本身会因为 `tappedObject` 查不到而收起，这里是把状态一起归零，
         //  免得留下一个指向不存在对象的 id）
         if (tappedObjectId == id) tappedObjectId = null
-        // 同 clearObjects：撤销条一次只撤**最近一次**操作
-        clearedObjectsBackup = null
+        // 删掉了什么要说一句（原来由底部那条 2 秒撤销条承担）
+        showToast("已删除 $name")
     }
 
     /** 点击命中附近的交点 / 极值点（#7 后半）。 */
@@ -2404,27 +2662,6 @@ class GraphState {
             extrema = extrema.take(MAX_FEATURE_HIGHLIGHTS)
         )
     }
-    data class DeletedObject(val index: Int, val obj: GraphObject)
-
-    var lastDeletedObject by mutableStateOf<DeletedObject?>(null)
-        private set
-
-    fun undoDeleteObject() {
-        val d = lastDeletedObject ?: return
-        val at = d.index.coerceIn(0, objects.size)
-        objects = objects.toMutableList().apply { add(at, d.obj) }
-        lastDeletedObject = null
-    }
-
-    fun forgetDeletedObject() {
-        lastDeletedObject = null
-    }
-
-    /** 清屏之前先把备份留好（点/线/度量都要，一条都不能少）。 */
-    private var clearedObjectsBackup: List<GraphObject>? = null
-
-    val canUndoObjectsClear: Boolean get() = clearedObjectsBackup != null
-
     /**
      * **清屏**（功能界面右上角的垃圾桶图标）。
      *
@@ -2432,47 +2669,21 @@ class GraphState {
      * [clearAllFunctions]（长按 +）的职责，两者刻意分开：用户画了半天的曲线
      * 不该被一个清几何对象的按钮清掉。
      *
-     * **给撤销机会**：清屏一下就全没了，和删函数一样是破坏性操作，手表上又没法弹
-     * 二次确认（比误删还烦），所以沿用那套"底部浮出小条、点一下撤回"的模式。
+     * **撤销**：和别的删除一样，`pushUndo` 在改动之前压了一步（快照里有对象、
+     * 对称规则、函数、滑动条），用工具条上的左箭头就能整屏撤回来 —— 原来那条
+     * "底部浮出小条、点一下撤回"本轮被用户要求删掉了。
      * 顺手把当前工具退回「移动」：清完屏还停在"切线"之类要选点的工具上，
      * 用户下一点又画出一个东西，反而像没清干净。
      */
     fun clearObjects() {
         if (objects.isEmpty()) return
-        clearedObjectsBackup = objects
-        // 顺手把"刚删掉的那一个"的备份丢掉：撤销条一次只该撤回**最近一次**破坏性操作，
-        // 留着两条备份会让"点撤销"撤掉一个用户已经不记得的东西。
-        lastDeletedObject = null
-        // 滑动条那一路同理（见 `removeSlider`）
-        lastDeletedSlider = null
+        // 撤销点：清屏是"一下就全没了"的破坏性操作，撤销栈要能撤回去
+        pushUndo("清屏")
         objects = emptyList()
         // 曲线对称的规则也一起丢掉：清屏之后不该还剩一条"会自己长回来"的对称曲线。
+        // （它进了快照，所以撤销时跟着一起回来。）
         transformedCurves.clear()
         backToMove()
-    }
-
-    fun undoObjectsClear() {
-        val backup = clearedObjectsBackup ?: return
-        objects = backup
-        clearedObjectsBackup = null
-    }
-
-    fun forgetObjectsClear() {
-        clearedObjectsBackup = null
-    }
-
-    /** 列表里的撤销条该不该出现（删单个对象 / 清屏，任一有备份就出现）。 */
-    val showObjectsUndo: Boolean get() = canUndoObjectsClear || lastDeletedObject != null
-
-    /**
-     * 撤销条（几何对象这一路）：清屏和删单个都从这一个入口撤。
-     * 清屏优先 —— 它的破坏面更大。
-     */
-    fun undoObjectsAny() {
-        when {
-            canUndoObjectsClear -> undoObjectsClear()
-            lastDeletedObject != null -> undoDeleteObject()
-        }
     }
 
 
@@ -3910,6 +4121,16 @@ class GraphState {
     companion object {
         /** 初始视野：x ∈ [-10, 10]。 */
         const val DEFAULT_HALF_RANGE = 10.0
+
+        /**
+         * 撤销栈的上限（步）。
+         *
+         * 为什么是 20：用户在手表上按左箭头，心里记的是"刚才那几步" ——
+         * 栈太深只会让"一直按回去"变成一件失控的事（而且每按一次都要重采样一遍）。
+         * 内存不是这里的约束：一步快照只存**几个 list 的引用**（元素共享），
+         * 量级几十~几百字节，20 步合计几十 KB（完整推导见 `undo` 那一节的注释）。
+         */
+        const val UNDO_STACK_LIMIT = 20
 
         /**
          * 点击命中**曲线 / 线段 / 直线 / 面积轮廓**的容差，占屏宽的比例。

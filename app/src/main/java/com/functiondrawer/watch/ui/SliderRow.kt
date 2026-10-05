@@ -202,6 +202,20 @@ fun SliderRow(
     val rowWidthPx = with(density) { rowWidth.toPx() }
     val swipeProgress = swipe.progress(rowWidthPx)
 
+    // ---- 整行长按的"有没有出界"观察者（本轮新增）----
+    //
+    // 用户要求（全局性）："所有按钮的长按判定都改成只有在按钮的矩形框内才判定"。
+    // 这一行的长按是**自己手写**的（下面那段 `withTimeoutOrNull + waitForUpOrCancellation`），
+    // 所以要在长按真的触发之前加一句 [PressInsideGuard.stayedInside]：
+    // 手指在按住期间离开这一行自己的矩形（含极小的 [PRESS_INSIDE_SLACK_FRACTION] 容差）
+    // → 这一次长按作废，不弹滑动条属性界面。
+    //
+    // 为什么用观察者而不是改那段 `waitForUpOrCancellation()`：AndroidX 那个函数**也**会
+    // 在出界时提前返回（于是超时不会触发），但它的边界是"节点矩形 + 系统最小触控目标补白"
+    // （这一行只有 0.15 短边 ≈ 35dp 高，补白 ≈6.5dp）—— 比用户要的容差大一档。
+    // 观察者是**零消费**的，所以"滑轨拖值 / 按住 ▶ / 左滑删除"三条既有语义一个都不受影响。
+    val longPressGuard = rememberPressInsideGuard(slider.id)
+
     Surface(
         // 滑动过程中整行朝砖红渐染（和函数行、对象行同一个"松手就要删了"的暗示）
         color = lerp(KeyPalette.normal, KeyPalette.danger, swipeProgress * SWIPE_DELETE_TINT),
@@ -238,9 +252,15 @@ fun SliderRow(
                         waitForUpOrCancellation()
                         true
                     }
-                    if (finishedEarly == null && !onPlayKey) onLongPress()
+                    // ⚠️ 本轮新增最后那个条件（"长按必须留在这一行自己的矩形里"）：
+                    // 手指中途离开过这一行 → `stayedInside == false` → 这一次长按作废。
+                    // 判定本体在 `PlotMetrics.pressInsideRect`，观察者在上面 `longPressGuard`。
+                    // 三个条件缺一不可：超时到了、不是按在播放键上、而且**手指一直没出界**。
+                    if (finishedEarly == null && !onPlayKey && longPressGuard.stayedInside) onLongPress()
                 }
             }
+            // 观察者：只记"手指有没有离开过这一行"，**一个字节都不消费**（见上面那段说明）
+            .pressInsideGuard(longPressGuard)
             // ---- 左滑删除（和函数行 / 对象行同一个实现，"起手区"由谁消费 down 决定）----
             //
             // ⚠️ `skipIfDownConsumed = true` 是这条行与另外两行**唯一**的差异：

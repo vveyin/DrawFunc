@@ -73,7 +73,7 @@ F(x, y) = 0    隐函数（marching squares）
 |---|---|---|
 | 普通键（数字、字母、括号） | `#2D2F33` | `bg_btn_dark.xml` |
 | 强调键（函数名、RAD/DEG、选中页签） | `#4B586B` | `bg_btn_accent.xml` |
-| 危险键（`⌫`、滑删渐染、撤销条） | `#824C51` | `bg_btn_danger.xml` |
+| 危险键（`⌫`、滑删渐染） | `#824C51` | `bg_btn_danger.xml` |
 | 文字 | `#FFFFFF`（次要 `#CCFFFFFF`） | `colors.xml` |
 | 浮层（气泡/调色板/对话框/信息卡） | `#F21F2124` + 1dp `#33FFFFFF` 描边 | `bg_log_bubble.xml` |
 | 形状 | `corners radius="50dp"` → **完整胶囊** | 四个 drawable 都是 |
@@ -91,7 +91,7 @@ F(x, y) = 0    隐函数（marching squares）
   （按高度取比例 0.42），因为"卡片"和"按键"是两种东西。
 
 风格统一的范围是**整个界面**：函数列表行、设置行、值 chip、`+` / `⚙` 图标按钮、
-信息卡、对话框与其按钮、toast、调色板、撤销条。图上的曲线和网格**不动**。
+信息卡、对话框与其按钮、toast、调色板。图上的曲线和网格**不动**。
 
 ### 键盘/列表之外的这一批新功能（对应需求 #1~#9）
 
@@ -111,15 +111,31 @@ F(x, y) = 0    隐函数（marching squares）
 | #8 的提示框 | `ui/SaveImageDialog.kt` | "保存这张图像？" + 命名输入框（隐藏扩展名）+ 取消/确定 + 存盘路径小字 + 字母表键盘（不显示大小写与括号） |
 | #1 的复数内核 | `engine/ComplexMath.kt` | 复数类型（Smith 除法、pow/exp/log/sqrt/三角/双曲）+ 自包含的复数表达式求值器 + 点标签格式化。35 个测试，全部用解析值（`e^{iπ}=-1`、`i^i=e^{-π/2}`…） |
 
+### 手势与撤销（这一版的硬约定）
+
+| 手势 | 判据落在哪 | 说明 |
+|---|---|---|
+| 工具条上一颗键滑到另一颗键（第一屏 `⚙`↔`+`、第二屏 `📁`↔`🗑`） | `DragGestures.awaitKeyToKeySwipe`：手指**进入另一颗键的矩形**才算达成 | 达成**之前零消费、零动画** —— 所以"在 `⚙` 上拖了十几像素又没滑到 `+`"仍然是一次干净的短按（短按 / 长按 / 按住线圈全不受影响）。达成后两颗端键同时让位（alpha 0.18、缩放 0.82、位移 4% 行宽），中间那对 `←` / `→` 箭头在 220ms 里缩放淡入，松手 4 秒或滑回去就收起 |
+| 撤销 / 重做 | `GraphState` 的快照栈（`pushUndo`，上限 20 步，`label` + `tag` 分组） | 撤销**只有这一条路**：所有"点此撤销"的 toast / 胶囊都删掉了，删除之类的操作只弹一句纯提示（点了没反应）。`tag` 让"同一个属性上连续打字"合成一步；一次动作分两段改的（如"删除并选中下一条"）用 `endUndoGroup()` 并成一步。**设置与视口刻意不进快照**（撤销不该把用户的显示设置也拽回去） |
+| 切屏：第一屏左边缘往右滑 | 左 26% 屏宽 × 12%~92% 屏高，**再排掉工具条那一块矩形**（`PlotMetrics.toolbarStripRect`） | 工具条那一块是"唤出撤销菜单"的地盘，从 `⚙` 左侧那一小条起手不该切屏 |
+| 切屏：第二屏右边缘往左滑 | 右 26% 屏宽 × **排掉工具条那一行本身**（上沿 `geometry.sy(TOOLBAR_TOP)`，下沿 = 上沿 + `0.125 × 短边` —— 和工具条 Box 自己的两个式子逐字相同） | 同一条理由：从 `🗑` 最外侧起手往左滑只该展开撤销菜单。这一行**之外**（上面 0~10% 屏高、下面行底~屏底）逐字照旧。注意下沿按**短边**算行高、而不是"真实屏高的 22.5%" —— 手机竖屏上前者只让出那一行（136dp），后者会多让 55dp |
+| 行左滑删除（函数行 / 对象行 / 滑动条行） | 起手不消费 down，只有**水平往左**越过触摸容差才认领；松手越过 1/3 行宽即删 | 三处共用 `RowSwipeDelete`。用 `positionChangeIgnoreConsumed()` 读位移，所以祖先那条切屏手势每帧消费也不会把删除冻住；松手后的扫出**从松手位置**继续（`SwipeDeleteMotion`），不会跳回屏幕中间 |
+
+三条通用规矩（机制与字节码依据写在 `ui/DragGestures.kt` 文件头）：
+
+* **认领前一个字节都不消费**：方向不对（竖直 / 反方向）立刻退出，把整串事件原样让给子节点（按钮的 `clickable`、列表的滚动）；
+* **长按只在按钮自己的矩形内判定**（用户要求）：手指飘出矩形就取消；
+* 按键 / 可点控件的**宽度**按上面那条硬约定自适应，**高度与字号**仍按短边 `metrics.sizeDp`。
+
 ### 离线验证脚本一览
 
 改这个项目**不需要**装到表上就能验一大半 —— 四个脚本都不联网、不用 Gradle：
 
 | 脚本 | 覆盖 | 当前 |
 |---|---|---|
-| `tools/run-engine-tests.ps1` | 引擎：表达式/视口/采样/几何/复数/曲线变换 | 143 |
-| `tools/run-keyboard-tests.ps1` | 数学键盘模型 + 字母表键盘模型 | 120 |
-| `tools/run-tool-tests.ps1` | 功能工具状态机 + 保存文件名规则 | 25 |
+| `tools/run-engine-tests.ps1` | 引擎：表达式/视口/采样/几何/复数/曲线变换 | 163 |
+| `tools/run-keyboard-tests.ps1` | 数学键盘模型 + 字母表键盘模型 | 127 |
+| `tools/run-tool-tests.ps1` | 功能工具状态机 + 保存文件名规则 + 文件格式 + **版面几何**（网格步长/标签吸附/圆弧宽度/工具条矩形/删除扫出/设置字段）+ 导出取名规则 | 217 |
 | `tools/typecheck-ui.ps1` | 全部 UI 源码的 Compose 类型检查（跳过 MainActivity） | 0 error |
 
 **注意**：`typecheck-ui.ps1` 只在真的出现 `error:` 时判失败；编译器把 warning 写到 stderr，
@@ -388,6 +404,31 @@ release 包用 `release.keystore` 自签名，口令在 `keystore.properties` �
 （两者都已被 `.gitignore` 忽略）。**如果要正式发布，请换一套自己的密钥和口令** ——
 现在这套只是为了侧载方便，口令就是默认值。
 
+#### ⚠️ release 包必须再跑一次三签（v1 + v2 + v3）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\sign-release.ps1
+```
+
+为什么构建完还要这一步（三条都是实测过的）：
+
+* `apksigner` **默认只签"这个包的 minSdkVersion 需要的那几档"** —— 本项目
+  `minSdk = 24`（Android 7）已经支持 v2，于是 AGP 产出的 release 包**只有 v2+v3，v1 是关的**；
+* `app/build.gradle.kts` 里那句 `signingConfigs { enableV1Signing = true }` 在 AGP 8.5.2 上
+  **被忽略**（写进去也没用，产物仍然 `v1 = false`），所以只能构建后补签；
+* 缺 v1 的后果是**只认 JAR 签名的老设备装不上**（用户就是在 Android 7 那台机器上撞到的）。
+
+`tools\sign-release.ps1` 干三件事，顺序不能反：`zipalign -p -f 4`（**签名之前**对齐）→
+`apksigner sign --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true`
+→ 校验三档 + `zipalign -c`。产物在 `build\apk-signed\DrawFunc-v1v2v3.apk`。
+**不需要装任何额外工具**：`java`（`D:\jdk17`）+ SDK 里的 `zipalign` / `apksigner` 就够，
+连 `jarsigner` 都不用（apksigner 自己会做 JAR 签名）。
+
+> ⚠️ 判断"v1 到底签上没有"**不能**看 `apksigner verify` 的默认输出：本包 minSdk = 24，
+> 默认那条命令只检 v2/v3，**即使 v1 完好也会打印 `Verified using v1 scheme: false`**。
+> 必须显式加 `--min-sdk-version 21`。`tools\verify-apk.ps1` 现在会自动用这个口径
+> 把 v1/v2/v3 三行都打出来。
+
 要重新生成密钥：
 
 ```powershell
@@ -399,9 +440,12 @@ release 包用 `release.keystore` 自签名，口令在 `keystore.properties` �
 ### 校验产物
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tools\verify-apk.ps1     # 默认校验 debug 包
-powershell -ExecutionPolicy Bypass -File tools\verify-apk.ps1 app\build\outputs\apk\release\app-release.apk
+powershell -ExecutionPolicy Bypass -File tools\verify-apk.ps1     # 默认校验 release 产物（没有才退回 debug）
+powershell -ExecutionPolicy Bypass -File tools\verify-apk.ps1 -ApkPath build\apk-signed\DrawFunc-v1v2v3.apk
 ```
+
+它会打印包名 / minSdk / targetSdk / label / 启动项 / 图标 / 无 Wear 标记这七项，
+外加**签名档位（v1 / v2 / v3）、zipalign 对齐、SHA256**。
 
 ### 只想验证数学引擎（不需要 Gradle、不需要网络）
 

@@ -59,6 +59,7 @@ $complexOpsFile = Join-Path $root 'app\src\main\java\com\functiondrawer\watch\ui
 # 它同样是**纯 Kotlin**（只 import engine.*），而且是最该离线钉住的一份 ——
 # 转义/版本/坏行这三条规则一旦写错，用户存下去的文件就再也读不回来。
 $fileFormatFile = Join-Path $root 'app\src\main\java\com\functiondrawer\watch\ui\FunctionFileFormat.kt'
+$fileExportFile = Join-Path $root 'app\src\main\java\com\functiondrawer\watch\ui\FileExport.kt'
 # 「取坐标」的文本替换（x(A) / y(A) → 点坐标数值）：同样是纯 Kotlin、只 import engine.GPoint。
 # 它改的是**用户写的表达式文本**，多改一个字符就会画出另一条曲线，所以必须离线钉住。
 $pointCoordsFile = Join-Path $root 'app\src\main\java\com\functiondrawer\watch\ui\PointCoordinates.kt'
@@ -79,6 +80,7 @@ if (-not (Test-Path $fileFormatFile)) { throw "找不到函数文件格式：$fi
 if (-not (Test-Path $pointCoordsFile)) { throw "找不到取坐标替换逻辑：$pointCoordsFile" }
 if (-not (Test-Path $plotMetricsFile)) { throw "找不到绘图尺度换算：$plotMetricsFile" }
 if (-not (Test-Path $graphObjectsFile)) { throw "找不到几何对象模型：$graphObjectsFile" }
+if (-not (Test-Path $fileExportFile)) { throw "找不到导出纯规则：$fileExportFile" }
 
 Remove-Item $outDir -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
@@ -96,7 +98,7 @@ Write-Host "   junit : $junit"
 & java -cp $compilerCp org.jetbrains.kotlin.cli.jvm.K2JVMCompiler `
     -no-stdlib -nowarn -jvm-target 17 `
     -cp "$stdlib;$junit;$hamcrest" `
-    -d $outDir $engineDir $toolsFile $saveNameFile $complexOpsFile $fileFormatFile $pointCoordsFile $plotMetricsFile $graphObjectsFile $testDir
+    -d $outDir $engineDir $toolsFile $saveNameFile $complexOpsFile $fileFormatFile $pointCoordsFile $plotMetricsFile $graphObjectsFile $fileExportFile $testDir
 if ($LASTEXITCODE -ne 0) { throw "Kotlin 编译失败 (exit $LASTEXITCODE)" }
 
 Write-Host '== 运行 JUnit ==' -ForegroundColor Cyan
@@ -106,7 +108,8 @@ Write-Host '== 运行 JUnit ==' -ForegroundColor Cyan
     com.functiondrawer.watch.tools.ComplexOpsTest `
     com.functiondrawer.watch.tools.FunctionFileFormatTest `
     com.functiondrawer.watch.tools.PointCoordinatesTest `
-    com.functiondrawer.watch.tools.PlotMetricsTest
+    com.functiondrawer.watch.tools.PlotMetricsTest `
+    com.functiondrawer.watch.tools.FileExportTest
 
 if ($LASTEXITCODE -ne 0) { throw "单元测试未通过 (exit $LASTEXITCODE)" }
 Write-Host '== 全部通过 ==' -ForegroundColor Green

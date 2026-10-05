@@ -87,6 +87,7 @@ import kotlinx.coroutines.flow.collectLatest
  * ```
  *        ●            ← 顶部抓手（暗示可以下滑回列表；和列表顶部的抓手同一套语言）
  *   📁             🗑  ← 左上角文件夹（函数文件列表）/ 右上角清屏（只清几何对象）
+ *                      ← **从 📁 滑到 🗑（或反过来）** = 中间浮出撤销菜单（← 撤销 / → 重做，本轮新增）
  *   ┌ 基本工具 ┐       ← 小标题（metrics.fontTiny，用户要求"字号设小一点"）
  *   [ 移动 ][ 描点 ]
  *   ┌ 度量 ┐
@@ -188,7 +189,7 @@ private const val SWIPE_DOWN_THRESHOLD = 0.09f
  * | | 起手热区（占**屏宽** × 占**真实屏高**） | 方向 | 触发距离 |
  * |---|---|---|---|
  * | 第一屏 `FunctionList` | 0 ~ 26% × 12% ~ 92% | 往**右**滑 → 进功能界面 | 0.09 × 短边 |
- * | 第二屏（本文件） | **74% ~ 100% × 0% ~ 100%** | 往**左**滑 → 回函数列表 | 0.09 × 短边 |
+ * | 第二屏（本文件） | **74% ~ 100% × 0% ~ 100%**，**但要排掉工具条那一条**（见下） | 往**左**滑 → 回函数列表 | 0.09 × 短边 |
  *
  * 两屏都用"**节点自己的真实尺寸** × 百分比"来判（第一屏 `size.width` / `size.height`，
  * 这一屏同样是 `size.width`，见下面的 `startsIn`），所以同一句话在任何屏形上都是
@@ -196,13 +197,35 @@ private const val SWIPE_DOWN_THRESHOLD = 0.09f
  * "至少要覆盖整条右边的高度"，所以是**整条右边**。
  * 触发距离两屏**本来就一致**（都是 `0.09 × 短边`：圆表 21dp、手机 37dp），没动。
  *
+ * ### ⚠️ 唯一的例外：**工具条那一条（整屏宽 × 屏高 10%~22.5%）让给撤销菜单**
+ *
+ * 用户原话（先后两次）："在能够唤出撤销菜单的按键的位置滑到另一个屏幕的判定应该取消掉。"
+ * 以及"**在右边缘手势的起手判据里把工具条那一段（屏高 10%~22.5%）排掉**"。
+ * 第二句是**最终口径**：排掉的是**那一条高度带**（**左右沿就是整屏宽**），
+ * 不是"工具条行自己的矩形"—— 理由与三块屏的实算写在 `PlotMetrics.ToolbarStripRect`。
+ *
+ * 于是 `startsIn` 里多一句"起手点不在 `toolbarStrip` 里"。原因是两边会打架：
+ * 工具条那一条在圆表上正好压着屏幕右边，而右边缘这条手势的起手区是 `x ≥ 74%` ——
+ * 两者在 🗑 最外侧那 **4.7dp**（x ∈ [74%, 76%]、y ∈ [23.3, 52.4]dp）上重叠。
+ * 从那一小条往左滑，用户想的是"从删除滑到文件夹"唤出撤销菜单，屏幕却切回了函数列表。
+ * **排除之后：从 🗑 最外侧那一小条起手往左滑，只会展开撤销菜单，不会再同时回列表。**
+ *
+ * | 设备 | 被排掉的那条带（整屏宽） | 说明 |
+ * |---|---|---|
+ * | 圆表 233dp（短边 = 屏高） | **x ∈ [0, 233]dp、y ∈ [23.30, 52.43]dp** | **与工具条 Box 的真实上下沿逐像素相等** |
+ * | 方表 200dp | x ∈ [0, 200]dp、y ∈ [20.00, 45.00]dp | 同上 |
+ * | 手机 411 × 850dp | x ∈ [0, 411]dp、y ∈ [85.00, 191.25]dp | 按**真实屏高**取 10%~22.5%（比那一行本身高 55dp，这是这个口径的必然结果） |
+ *
+ * 这一条带**之外**的右边缘往左滑**逐字照旧**（包括 y < 10% 与 y > 22.5% 两段）。
+ * **第一屏那条左边缘手势用同一个口径**（它也排掉同一条带）。
+ *
  * ### 具体数值
  *
  * | 设备 | 本屏（右边缘） | 第一屏（左边缘，对照） |
  * |---|---|---|
- * | 圆表 466×466 / d2（233dp，短边 = 屏高） | x 172.4 ~ 233dp（74%~100% 屏宽）、y **全高 0~233dp** | x 0 ~ 60.6dp、y 27.96 ~ 214.4dp |
- * | 手机 411 × 850dp | x 304.1 ~ 411dp、y **全高 0~850dp** | x 0 ~ 106.9dp、y 102 ~ 782dp |
- * | 方表 400×400 / d2（200dp，短边 = 屏高） | x 148 ~ 200dp、y **全高 0~200dp** | x 0 ~ 52dp、y 24 ~ 184dp |
+ * | 圆表 466×466 / d2（233dp，短边 = 屏高） | x 172.4 ~ 233dp（74%~100% 屏宽）、y **全高 0~233dp 减去 23.3~52.4dp** | x 0 ~ 60.6dp、y 27.96 ~ 214.4dp 减去同一条带 |
+ * | 手机 411 × 850dp | x 304.1 ~ 411dp、y **全高 0~850dp 减去 85~191.3dp** | x 0 ~ 106.9dp、y 102 ~ 782dp 减去同一条带 |
+ * | 方表 400×400 / d2（200dp，短边 = 屏高） | x 148 ~ 200dp、y **全高 0~200dp 减去 20~45dp** | x 0 ~ 52dp、y 24 ~ 184dp 减去同一条带 |
  *
  * 圆表上这条从"0.16~0.90 屏高"变成"整条屏高"是有意的：左右两条因此都是
  * "贴着一整条边往里滑"，手机上更是从"顶部一小截"变成"整条右边"。
@@ -248,6 +271,13 @@ private const val SECTION_TITLE_H = 0.055f
 private const val TOOLBAR_TOP = 0.10f
 /** 工具条行高（占屏高）。0.125 × 233dp ≈ 29.1dp。 */
 private const val TOOLBAR_H = 0.125f
+/**
+ * ⚠️ 这里原来还有一个 `TOOLBAR_BOTTOM = TOOLBAR_TOP + TOOLBAR_H`（= 0.225），
+ * 用来把"禁区"的下沿按**真实屏高**算成 22.5%。用户后来点名改口径：
+ * **"只排掉那一行本身"** —— 于是那个常量删掉了，禁区改成"行顶 + 行高（按短边）"，
+ * 也就是工具条 Box 自己那两个式子的组合（见下面 `toolbarStrip` 的调用点）。
+ * 圆表上两种口径**逐像素相等**（短边 = 屏高），手机上方才那 55dp 的富余被收掉。
+ */
 /** 图标按钮边长占屏比 —— 必须等于 `WatchMetrics.iconButton` 的 0.18。 */
 private const val ICON_BTN_H = 0.18f
 
@@ -323,6 +353,19 @@ fun FunctionsScreen(
     onSwipeDown: () -> Unit,
     /** 左上角文件夹按钮：打开应用的 saves 目录（函数文件列表）。 */
     onOpenSaves: () -> Unit,
+    /**
+     * 工具条上那对箭头键（本轮新增）能不能按 —— false 时对应的键**变暗**
+     * （点它只弹一句「没有可撤销的操作」，不会装作没听见）。
+     *
+     * 语义与第一屏**逐个相同**（同一个 `GraphState` 历史栈）：
+     * 这一屏的 🗑（清屏 / 长按清空全部）也是"有意义的改动"，同样会被记进栈。
+     */
+    canUndo: Boolean,
+    canRedo: Boolean,
+    /** 左箭头按下：撤销一步（界面层负责弹 toast）。 */
+    onUndoStep: () -> Unit,
+    /** 右箭头按下：重做一步。 */
+    onRedoStep: () -> Unit,
     rotary: Flow<Float>
 ) {
     val scheme = MaterialTheme.colors
@@ -396,6 +439,73 @@ fun FunctionsScreen(
             }
         }
 
+        // ---- 顶部那一条的两样东西（工具条宽度 + 撤销菜单状态）----
+        //
+        // ⚠️ 必须在这里声明（而不是贴着下面那个工具条 Box）：顶部**抓手**
+        // （`y = 0.038 短边` 那道小横线，它在工具条**上面**）的淡出动画也要读
+        // `undoMenu.progress`，而它在这个函数里排得更早 —— Kotlin 的局部量
+        // 必须先声明后使用。
+        //
+        // 宽度和下面工具条 Box 用的**是同一个值**（圆屏 = 这一对按钮所在高度的弧宽比例
+        // × 短边、非圆屏 = 铺满屏宽减左右各 3%），见 `ScreenGeometry.rowWidth` ——
+        // 也就是 README 那条硬约定的唯一实现。
+        val toolbarRowWidth = geometry.rowWidth(
+            metrics = metrics,
+            ringFraction = toolbarWidthFraction(metrics, isRound),
+            isRound = isRound
+        )
+        val toolbarRowWidthPx = with(density) { toolbarRowWidth.toPx() }
+        // 「从一颗键滑到另一颗键」唤出撤销 / 重做：和第一屏**同一份实现、同一套几何判据**
+        // （`PlotMetrics.toolbarKeyAt` / `toolbarMenuCrossedToOtherKey`，纯函数、离线单测钉着）。
+        // 这一屏的实算（行宽 386.3dp、单键宽 74.0dp @手机；圆表行宽 121.2dp、单键 41.9dp）：
+        //   📁 的矩形 [0, w]  中间空当 (w, 行宽 − w)   🗑 的矩形 [行宽 − w, 行宽]
+        //   最短行程 = 空当宽度（圆表 37.3dp / 手机 238.4dp）；典型行程 = 中心距（79.2 / 312.4dp）
+        // 手势挂在下面那条工具条自己身上（不是整屏）；**达成之前一帧动画都没有**、
+        // 也**不消费任何事件**（所以 📁 的短按、🗑 的"按住转满一圈"照旧）。
+        val undoMenu = rememberToolbarUndoMenu(metrics)
+
+        /**
+         * 顶部工具条那一条的**整条全宽矩形**（屏幕坐标，px）—— 切屏手势的"禁区"。
+         *
+         * 用户口径（两轮，**以最后一句为准**）：
+         *   * "在能够唤出撤销菜单的按键的位置滑到另一个屏幕的判定应该取消掉。"
+         *   * "在右边缘手势的起手判据里把工具条那一段（屏高 10%~22.5%）排掉。"
+         *   * "**只排掉那一行本身。**" ← 本轮按这句改
+         *
+         * 于是上下沿不再各按"真实屏高的百分比"取，而是**逐像素等于工具条那一行**：
+         *   上沿 = `geometry.sy(TOOLBAR_TOP)`（行顶，占**真实屏高** 10%）
+         *   下沿 = 上沿 + `metrics.sizeDp * TOOLBAR_H`（行高，占**短边** 12.5%）
+         * —— 这正是工具条 Box 自己用的两个式子（`.offset(y = geometry.sy(TOOLBAR_TOP))`
+         * 与 `.height(metrics.sizeDp * TOOLBAR_H)`），所以禁区**就是那一行**，
+         * 不会再"比那一行高出一截"。左右沿仍是**整屏宽**（用户第一句要的是"那一段"）。
+         *
+         * | 设备 | 这一行（= 禁区） | 与上一版（屏高 10%~22.5%）的差别 |
+         * |---|---|---|
+         * | 圆表 233dp（d2，短边 = 屏高） | x ∈ [0, 233]dp、y ∈ [23.30, 52.43]dp | **逐像素相同**（短边 = 屏高，两种口径在这里等价） |
+         * | 方表 200dp（d2，短边 = 屏高） | x ∈ [0, 200]dp、y ∈ [20.00, 45.00]dp | 同上 |
+         * | 手机 411 × 850dp（d2.75） | x ∈ [0, 411]dp、y ∈ [85.00, 136.38]dp | 下沿从 **191.25dp 收到 136.38dp** —— 手机右边少让 55dp（这正是用户要的"只排掉那一行本身"） |
+         *
+         * 所以这一屏的"右边缘往左滑 → 回函数列表"在 `y` 落进这一行时**不认起手**
+         * （那一块让给工具条上的撤销菜单手势）；这一行**之外**（上面 0~10% 屏高、下面
+         * 行底~屏底）的右边缘往左滑**逐字照旧**。排除之后：**从 🗑 最外侧那一小条
+         * 起手往左滑，只会展开撤销菜单，不会再同时回函数列表**。
+         *
+         * ⚠️ 它同时是下面那条右边缘手势 `pointerInput` 的 **key**（data class，
+         * 值没变就不重启手势）—— 手势读到的禁区永远是**当前**那一块。
+         * ⚠️ **顶部下滑那条手势不带这个禁区**（用户要求"顶部下滑回图像界面照旧"）：
+         * 它靠"down 被按钮消费就放行"分区，落在两道键中间的空当时撤销菜单手势
+         * **根本不开始**（零消费），下滑照常。
+         */
+        val toolbarStrip = toolbarStripRect(
+            screenWidthPx = with(density) { geometry.screenW.toPx() },
+            bandTopPx = geometry.syPx(TOOLBAR_TOP),
+            // ⚠️ 下沿 = 行顶 + **行高（按短边）**，不是"真实屏高的 22.5%" —— 用户要求
+            // "只排掉那一行本身"。行高这一项与工具条 Box 的 `.height(metrics.sizeDp * TOOLBAR_H)`
+            // 是同一个式子，所以禁区永远跟着那一行走，两边不会各自漂。
+            bandBottomPx = geometry.syPx(TOOLBAR_TOP) +
+                with(density) { (metrics.sizeDp * TOOLBAR_H).toPx() }
+        )
+
         Box(
             Modifier
                 .fillMaxSize()
@@ -463,7 +573,7 @@ fun FunctionsScreen(
                         )
                     }
                 }
-                .pointerInput(Unit) {
+                .pointerInput(toolbarStrip) {
                     // ---- 右边缘往左滑 → 回函数列表（并播左右切换动画）----
                     awaitEachGesture {
                         awaitOneWayDrag(
@@ -476,7 +586,20 @@ fun FunctionsScreen(
                             // `offset.x < size.width * SWIPE_EDGE_W`）**逐字同一套写法** ——
                             // 两屏因此都是"贴着一整条边往里滑"，不再有"拿短边当屏高"的偏差。
                             // 高度**不设上下限**：用户要求"至少要覆盖整条右边的高度"。
-                            startsIn = { p -> p.x >= size.width * (1f - EDGE_ZONE_W) },
+                            //
+                            // ⚠️ 唯一的例外（用户点名的那一条）：**工具条那一行排掉** ——
+                            // 起手点落在"整屏宽 × 工具条那一行自己的上下沿"这一块里时
+                            // （`toolbarStrip`，圆表 = y 23.3~52.4dp；手机 = 85.0~136.4dp），
+                            // 这一串**不算**右边缘左滑，让给工具条上的撤销菜单手势。
+                            // 于是"从 🗑 最外侧那一小条起手往左滑"**只会展开菜单**、
+                            // 不会再同时回函数列表；这一行之外的起手**逐字照旧**。
+                            // 只改这一句判据：方向（`positive = false`）、
+                            // 认领前的消费语义、阈值（`swipeEdgePx`）、
+                            // `onEnd → onSwipeDown()` 与那条左右切换动画**全都没动**。
+                            startsIn = { p ->
+                                p.x >= size.width * (1f - EDGE_ZONE_W) &&
+                                    !(toolbarStrip?.contains(p.x, p.y) ?: false)
+                            },
                             // **有意不设** `skipIfDownConsumed`：这条带里主要是工具列表，
                             // 一旦列表的滚动节点也消费 down、加了这句就会让整条手势**静默失效**
                             // （比"从 chip 上起手左滑会回列表"严重得多）。
@@ -509,6 +632,10 @@ fun FunctionsScreen(
             // 手机上也不会错位 —— 这一条不是"短边当屏高"那类偏差，别顺手改成 `geometry.sy`：
             // 圆表上 `sy(0.038)` = 32.3dp（vs 现在 8.85dp）会把这道小条从顶部挪到
             // 工具条和列表**中间**，圆表观感整个变了（而用户对本轮的硬要求是圆表逐像素不变）。
+            //
+            // ⚠️ 本轮新增最后那一层 `graphicsLayer`：撤销菜单展开时它**淡出**
+            // （只动图层，位置/尺寸不变）—— 和第一屏同一处理由同一个常量驱动
+            // （`PlotMetrics.toolbarMenuHandleAlpha`）。
             Box(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
@@ -517,6 +644,7 @@ fun FunctionsScreen(
                     .height(metrics.sizeDp * 0.011f)
                     .clip(CircleShape)
                     .background(scheme.outlineVariant)
+                    .graphicsLayer { alpha = toolbarMenuHandleAlpha(undoMenu.progress.value) }
             )
 
             // ---- 顶部两颗：左上角「函数文件」文件夹、右上角清屏 ----
@@ -577,17 +705,23 @@ fun FunctionsScreen(
             // = 0.1791 × 0.1242 个短边 —— **完整落在按钮里侧**（按钮 0.18 × 0.125），
             // 所以在任何屏形上"线圈都绕着按键"，不会像用户报的那样跑到按钮外面/变成椭圆。
             // ==================================================================
-            Row(
+            // ---- 顶部那一条：📁 / 🗑 两颗键 + 叠在中间的撤销菜单 ----
+            //
+            // ⚠️ 本轮和第一屏做了**同一件事**：把原来那个 `Row` 换成了"同样尺寸的
+            // `Box` 里放一个 `fillMaxSize` 的 `Row`"，多出来的那一层是为了把撤销菜单
+            // 叠在**同一条**上而不占新地方。形状/位置/宽度**一个字没改**：
+            //   * Box 的修饰符链就是原来 Row 的那一条（align / offset / width / height /
+            //     graphicsLayer 入场）；
+            //   * 里面的 Row 是 `fillMaxSize()` + `SpaceBetween` + 垂直居中；
+            //   * 新加的手势**不消费**落在按钮上的按下，所以 📁 的短按、
+            //     🗑 的"按住转满一圈"行为都不变（详见 `Common.kt` 里那张参数表）。
+            //
+            // （宽度与撤销菜单状态在上面声明 —— 顶部抓手那道小横线也要读它。）
+            Box(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .offset(y = geometry.sy(TOOLBAR_TOP))
-                    .width(
-                        geometry.rowWidth(
-                            metrics = metrics,
-                            ringFraction = toolbarWidthFraction(metrics, isRound),
-                            isRound = isRound
-                        )
-                    )
+                    .width(toolbarRowWidth)
                     .height(metrics.sizeDp * TOOLBAR_H)
                     // 入场：淡入 + 从 0.90 放大，和五栏的入场同一个写法（只是不等延迟）
                     .graphicsLayer {
@@ -595,15 +729,32 @@ fun FunctionsScreen(
                         val s = 0.90f + 0.10f * topIn
                         scaleX = s
                         scaleY = s
-                    },
+                    }
+                    // ---- 从一颗键滑到另一颗键：唤出 / 收起撤销·重做菜单（本轮新增）----
+                    // 达成 = "落点在 📁 或 🗑 上 + 手指进了另一颗键的矩形"；达成之前
+                    // **一个字节都不消费**（两颗键的短按/长按、🗑 的按住清屏全都照旧）。
+                    .then(undoMenu.gesture)
+            ) {
+            Row(
+                modifier = Modifier.fillMaxSize(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 // 「函数文件」：进 saves 目录（列表里点开/长按改名/左滑删除）
+                //
+                // ⚠️ `modifier` 只加一层"让位"的 `graphicsLayer`（撤销菜单展开时
+                // 暗下去 + 缩一点 + 朝左让 4% 行宽）—— 这颗键的尺寸、位置、命中区
+                // 一个像素都不变，也不多一个布局节点（`WatchIconButton` 的尺寸由它自己
+                // 那两行 `.width/.height` 决定，见 README 里"形状锁定"那一条）。
                 WatchIconButton(
                     icon = FolderIcon,
                     contentDescription = "函数文件",
                     metrics = metrics,
+                    modifier = Modifier.toolbarYield(
+                        progress = undoMenu.progress,
+                        toRight = false,
+                        rowWidthPx = toolbarRowWidthPx
+                    ),
                     onClick = onOpenSaves
                 )
 
@@ -614,9 +765,19 @@ fun FunctionsScreen(
                 //
                 // 短按的 `onClick` 是空的，所以这里**不需要** `+` 键那个闩
                 // （HoldRing 里的两道锁照旧生效，只是这里没有"短按动作"可误触发）。
+                //
+                // ⚠️ 本轮给 `modifier` 加了一层"让位"（撤销菜单展开时朝右让 4% 行宽、
+                // 暗到 0.18、缩到 0.82）。传这里而不是套一个 `Box`：长按的**线圈**
+                // 画在 `HoldToConfirm` 自己的 Box 里（和按钮是兄弟），套在外面的图层
+                // 罩不住它 —— 那会出现"按键暗了、线圈还亮着"。
                 HoldToConfirm(
                     metrics = metrics,
                     ringColor = KeyPalette.danger,
+                    modifier = Modifier.toolbarYield(
+                        progress = undoMenu.progress,
+                        toRight = true,
+                        rowWidthPx = toolbarRowWidthPx
+                    ),
                     onConfirm = onClearAll
                 ) {
                     WatchIconButton(
@@ -634,6 +795,24 @@ fun FunctionsScreen(
                         onClick = {}
                     )
                 }
+            }
+
+            // ---- 撤销菜单：叠在这条工具条的**正中间**（本轮新增）----
+            //
+            // 和第一屏**同一个组件**（`Common.ToolbarUndoRedoMenu`）：用户要的就是
+            // "在功能列表界面从文件夹滑到删除也是一样的道理" —— 一样的不只是手势，
+            // 连菜单本体、动画、两颗箭头键都是同一份实现。
+            // `Modifier.align(Alignment.Center)` = 只占那两颗键那么大一块
+            // （尺寸正好等于两颗键，才结构性地保证两端的 📁 / 🗑 不被挡到）。
+            ToolbarUndoRedoMenu(
+                menu = undoMenu,
+                metrics = metrics,
+                canUndo = canUndo,
+                canRedo = canRedo,
+                onUndo = onUndoStep,
+                onRedo = onRedoStep,
+                modifier = Modifier.align(Alignment.Center)
+            )
             }
 
             // ---- 五栏工具 ----
@@ -1326,6 +1505,18 @@ internal fun GraphObjectRow(
         val dotHitW = metrics.sizeDp * 0.105f
         val textGap = metrics.sizeDp * 0.02f
 
+        // ---- 两个长按区的"有没有出界"观察者（本轮新增，用户全局性要求）----
+        //
+        // "所有按钮的长按判定都改成只有在按钮的矩形框内才判定"：对象行的色点区
+        // （长按调色板）与文字区（长按进属性屏）都是 `combinedClickable(onLongClick=…)`；
+        // AndroidX 本身会在出界时取消，但它的边界是"节点矩形 + 系统最小触控目标补白"
+        // （色点区只有 ≈30×35dp，补白能到 10dp 以上）—— 比用户要的容差大一档，
+        // 会出现"手指飘到隔壁文字区了，调色板还是弹出来"。所以各自挂一个**零消费**的
+        // 观察者，长按回调执行前问一句 `stayedInside`。
+        // 两区各一格状态（矩形不同，共用会让"在文字区里飘"误判成色点区也出界）。
+        val dotPressGuard = rememberPressInsideGuard(obj.id)
+        val textPressGuard = rememberPressInsideGuard(obj.id)
+
         Row(
             modifier = Modifier.fillMaxSize(),
             verticalAlignment = Alignment.CenterVertically
@@ -1346,9 +1537,14 @@ internal fun GraphObjectRow(
                     .width(dotHitW + sidePad)
                     // 高度撑满整行：这一列从上到下都是"显隐开关"，不留死角
                     .fillMaxHeight()
+                    // 长按（调色板）的前提：手指**一直没离开这一格**（本轮新增，
+                    // 见上面 `dotPressGuard` 那段与 `Common.PressInsideGuard`）。
+                    // 零消费 ⇒ 短按（切显隐）与整行左滑删除都不受影响。
+                    .pressInsideGuard(dotPressGuard)
                     .combinedClickable(
                         onClick = onToggleVisible,
-                        onLongClick = onPickColor
+                        // 出界过 → 这一次长按作废（不弹调色板）
+                        onLongClick = { if (dotPressGuard.stayedInside) onPickColor() }
                     )
                     // 内边距加在 clickable **之内**：手势区含边条，内圈圆点仍居中在
                     // 原来那 0.105 的格子里 → 观感与改动前一致。
@@ -1396,12 +1592,17 @@ internal fun GraphObjectRow(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxHeight()
+                    // 长按（进属性屏）的前提：手指**一直没离开文字区**（本轮新增，
+                    // 见上面 `textPressGuard` 那段）。零消费 ⇒ 短按（详情页）、
+                    // 色点手势与整行左滑删除都不受影响。
+                    .pressInsideGuard(textPressGuard)
                     .combinedClickable(
                         interactionSource = press.source,
                         indication = null,
                         // 短按 = 详情页（只读、显示完全）
                         onClick = onDetails,
-                        onLongClick = onProperties
+                        // 出界过 → 这一次长按作废（不进属性屏）
+                        onLongClick = { if (textPressGuard.stayedInside) onProperties() }
                     )
                     // 左/右内边距同样在手势区之内 → 中间那条缝和右端边条都归它
                     .padding(start = textGap, end = sidePad),

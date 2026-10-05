@@ -72,7 +72,8 @@ Write-Host '== 运行 JUnit ==' -ForegroundColor Cyan
     com.functiondrawer.watch.engine.PlotterTest `
     com.functiondrawer.watch.engine.GeometryTest `
     com.functiondrawer.watch.engine.ComplexMathTest `
-    com.functiondrawer.watch.engine.CurveTransformTest
+    com.functiondrawer.watch.engine.CurveTransformTest `
+    com.functiondrawer.watch.engine.FeatureFinderTest
 
 if ($LASTEXITCODE -ne 0) { throw "单元测试未通过 (exit $LASTEXITCODE)" }
 Write-Host '== 全部通过 ==' -ForegroundColor Green

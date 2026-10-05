@@ -114,7 +114,7 @@ import kotlin.math.min
  *    ├─ 点某一行      → 函数编辑器（改表达式）
  *    ├─ 长按某一行    → 属性编辑界面（#4：名称 / 线型 / 线径）
  *    ├─ 长按滑动条行  → 滑动条属性界面（#4：名称 / 下界 / 上界 / 步长）
- *    ├─ 从行右侧左滑  → 删除（底部浮出撤销条）
+ *    ├─ 从行右侧左滑  → 删除（弹一条纯提示的 toast「已删除 a(x)」；撤销走工具条上那对箭头）
  *    ├─ 点 +          → 新建函数并进编辑器
  *    ├─ 长按 +        → 保存函数文件：弹命名浮窗，**浮窗底下垫的是模糊的函数图像**
  *    │                   （见下面"保存浮窗的底图"那一段 —— 那一条路**不走路由**，
@@ -206,19 +206,11 @@ fun GraphScreen(
             val settings = state.settings
             val sliders = state.sliders
 
-            /**
-             * **撤销条现在会不会显示**（本轮从下面 `FunctionListScreen(showUndo = …)` 那一行
-             * 提上来，变成两处共用的一个答案）：
-             *
-             *   ① 第一屏那条「已删除 · 点此撤销」自己（`showUndo`）；
-             *   ② **toast 的落点** —— 撤销条在时，toast 必须落在它**上方**
-             *      （用户本轮明确要求"移动后别和撤销条叠在一起"）。
-             *
-             * 两处读同一个值，"会不会撞在一起"就不再靠两处各自猜：只要这一份是真的，
-             * 下面 `toastBottomPad(...)` 就会把 toast 抬到撤销条之上。
-             */
-            val undoVisible = state.lastDeleted != null || state.canUndoClear ||
-                state.showObjectsUndo || state.lastDeletedSlider != null
+            // （这里原来有一个 `undoVisible`：算"底部那条 2 秒撤销条会不会显示"，
+            //   两处读它 —— 第一屏的 `showUndo` 与下面 toast 的落点。
+            //   本轮用户明确要求"把所有的撤销的 toast 提示都给删掉"，那条撤销条连同
+            //   这个派生值一起删了；toast 的落点因此只剩"底部热区 + 缩放栏"这一个约束，
+            //   见下面的 `toastBottomPad`。）
 
             // ---- 把它自己从系统手势里排除出去（需求 #6，设置里那个开关）----
             //
@@ -443,48 +435,14 @@ fun GraphScreen(
                 )
             }
 
-            // 撤销条 / toast 都只留 2 秒（用户要求，见 UNDO_VISIBLE_MS）
-            //
-            // ⚠️ **每一路**删除/清空的备份字段**全都**要进 key、也全都要忘掉：
-            // 这个 App 有**五路**删除/清空，各自在自己的字段里留备份（`GraphState`）：
-            //   * 删一个函数 → `lastDeleted`；清空所有函数 → `clearedBackup`（`canUndoClear`）；
-            //   * 删一个几何对象 → `lastDeletedObject`；清屏（清对象）→ `clearedObjectsBackup`
-            //     （`canUndoObjectsClear`）；
-            //   * 删一条**滑动条** → `lastDeletedSlider`（#3 的"滑动条行也能左滑删除"）。
-            // 上一版只盯了**前两条** —— 于是：
-            //   1. 删掉一个几何对象之后，撤销条**永远不会自己消失**（"2 秒撤销条"只在函数那
-            //      条路上成立），一直压在列表底部；
-            //   2. 更糟的是那笔过期的备份会一直被**后面每一次**撤销条显示出来：用户删完一个
-            //      函数、等 2 秒后点撤销，撤掉的其实是很久以前那个对象 —— 两笔删除混在一起了。
-            // （用户本轮的要求原话：对象行的删除"行为与函数行一致 …… + 2 秒撤销条"，
-            //   而且"撤销条出现时不要把两个对象的撤销混在一起"。）
-            //
-            // ⚠️ 加滑动条那一路时**必须同时**做三件事，少一件就复现上面那个坑：
-            //   ① 这里的 key 里加 `state.lastDeletedSlider`；
-            //   ② 下面的条件里加它（不加：**别的路**在计时、滑动条这一路的撤销条不消失）；
-            //   ③ 超时后调 `state.forgetDeletedSlider()`（不加：撤销条永不消失、
-            //      而且下次删别的东西时点撤销会撤到那条很久以前的滑动条）。
-            // 另外每一路自己动手时也会把其余几路清掉（`GraphState.removeSlider` 等），
-            // 保证"一次只撤最近一次操作"。
-            LaunchedEffect(
-                state.lastDeleted,
-                state.canUndoClear,
-                state.lastDeletedObject,
-                state.canUndoObjectsClear,
-                state.lastDeletedSlider
-            ) {
-                if (state.lastDeleted != null || state.canUndoClear ||
-                    state.lastDeletedObject != null || state.canUndoObjectsClear ||
-                    state.lastDeletedSlider != null
-                ) {
-                    delay(UNDO_VISIBLE_MS)
-                    state.forgetDeleted()
-                    state.forgetCleared()
-                    state.forgetDeletedObject()
-                    state.forgetObjectsClear()
-                    state.forgetDeletedSlider()
-                }
-            }
+            // ⚠️ 这里原来有一段"2 秒到期就把五路撤销备份全忘掉"的 effect
+            // （`lastDeleted` / `clearedBackup` / `lastDeletedObject` /
+            //  `clearedObjectsBackup` / `lastDeletedSlider` 各一路，配套还有一整节
+            //  "哪一路忘了会怎样"的血泪注释）。**本轮整套删掉了** ——
+            // 用户要求"把所有的撤销的 toast 提示都给删掉"，那五路备份随之一起删，
+            // 于是这个 effect 的 key 与函数体都没有了对象。
+            // 撤销现在只有一条路：`GraphState` 里的快照栈 + 工具条上的两颗箭头，
+            // 所以"某一路的撤销条永不消失"这类坑在结构上也不存在了。
 
             // 采样跑完之后，把待提示的报错弹成 toast
             LaunchedEffect(state.plot, state.pendingErrorFor) {
@@ -493,10 +451,10 @@ fun GraphScreen(
                 state.pendingErrorFor = null
             }
 
-            // toast 自动消失
+            // toast 自动消失（**底部现在只剩这一条胶囊**：撤销条本轮删了）
             LaunchedEffect(state.toast) {
                 if (state.toast != null) {
-                    delay(UNDO_VISIBLE_MS)
+                    delay(TOAST_VISIBLE_MS)
                     state.dismissToast()
                 }
             }
@@ -540,6 +498,11 @@ fun GraphScreen(
              */
             LaunchedEffect(state.route) {
                 state.discardBlankDraft()
+                // 换屏 = 这一串"连续改动"到此为止（本轮新增）：
+                // 撤销栈里"同一类改动只算一步"靠的是一个 tag（例如 `edit:5`），
+                // 不在这里清掉的话，"进编辑器改一下 → 退出 → 再进去改一下"会被算成
+                // **同一步**撤销，撤一次把两回改动一起撤掉。见 `GraphState.endUndoGroup`。
+                state.endUndoGroup()
             }
 
             // 注意：**滑动条播放的那段循环不在这里**，它在下面 `GraphRoute` 里
@@ -732,8 +695,12 @@ fun GraphScreen(
                         state.route = Route.Details(id)
                     },
                     onToggleVisible = { id ->
+                        // 走状态层那个**带撤销点**的方法（本轮新增 `GraphState.setVisible`）：
+                        // 直接 `updateFunction(fn.copy(visible = …))` 的话，这一步在历史栈里
+                        // 会被算成"编辑 a(x)"（tag 是 `edit:<id>`），和"正在编辑器里打字"
+                        // 那一串合并 —— 而"点了色点改显隐"在用户心里是独立的一步。
                         state.functions.firstOrNull { it.id == id }?.let { fn ->
-                            state.updateFunction(fn.copy(visible = !fn.visible))
+                            state.setVisible(id, !fn.visible)
                         }
                     },
                     onDelete = { id -> state.removeFunction(id) },
@@ -765,21 +732,29 @@ fun GraphScreen(
                         state.route = Route.About
                     },
                     onSwipeDown = { state.leaveToolsMemory(); state.route = Route.Graph },
-                    // 撤销条：函数 / 滑动条 / 几何对象这三路都走这一个入口
-                    // （#9 的清屏也留了后路，见 GraphState.clearObjects）。
+                    // ---- 工具条上那对箭头：**唯一**的撤销入口（本轮）----
                     //
-                    // ⚠️ 每一路都要在这里有一条分支：少一条，"撤销"就会落到 `else`
-                    // 去撤别的东西（而用户看到的是"刚删的那一行没回来"）。
-                    // 五路各自动手时也会把别的几路清掉（见 `GraphState.removeSlider` 等），
-                    // 所以这里的分支顺序只影响"同时有好几笔备份"这种理论上不该出现的状态。
-                    showUndo = undoVisible,
-                    onUndo = {
-                        when {
-                            state.canUndoClear -> state.undoClearAll()
-                            state.lastDeleted != null -> state.undoDelete()
-                            state.lastDeletedSlider != null -> state.undoDeleteSlider()
-                            else -> state.undoObjectsAny()
-                        }
+                    // 原来这里还有一条 `showUndo = …` / `onUndo = { … 五路分支 … }`
+                    // 给底部那条 2 秒「已删除 · 点此撤销」用。用户本轮明确要求
+                    // "把所有的撤销的 toast 提示都给删掉"，所以那一整块（连同 `GraphState`
+                    // 里五路备份、上一版那个 2 秒到期 effect）**全删了**；
+                    // 删除动作现在只管 `pushUndo` 记一步 + 弹一条纯提示的 toast。
+                    //
+                    // 栈空时**照样可点**，只是弹一句说明 —— 用户点了没反应是最难受的
+                    // （这条规矩在 `ToolbarUndoRedoMenu` 的参数说明里也写了一遍）。
+                    canUndo = state.canUndo,
+                    canRedo = state.canRedo,
+                    onUndoStep = {
+                        val label = state.undo()
+                        state.showToast(
+                            if (label == null) "没有可撤销的操作" else "已撤销：$label"
+                        )
+                    },
+                    onRedoStep = {
+                        val label = state.redo()
+                        state.showToast(
+                            if (label == null) "没有可重做的操作" else "已重做：$label"
+                        )
                     },
                     // 长按 `+` = 把当前**全部函数信息**存成一个 `.fdf` 文件。
                     // 不再切到图像界面（理由见上面 saveDialogVisible 那段注释）。
@@ -801,9 +776,9 @@ fun GraphScreen(
                         state.route = Route.SliderProperties(id)
                     },
                     // 左滑滑动条行（滑轨和播放键以外的地方）→ 删掉它。
-                    // 和删函数/删对象**同一条**撤销路：`removeSlider` 把整条 Slider
-                    // 备份进 `lastDeletedSlider`，于是底部浮出 2 秒的
-                    // 「已删除 · 点此撤销」（见上面那个 effect 与 showUndo）。
+                    // 撤销走**唯一**那条路：`removeSlider` 在改动前 `pushUndo` 记一步
+                    // （快照里有整条滑动条），用工具条上的左箭头就能整条要回来；
+                    // 同时弹一条纯提示的「已删除滑动条 a」。
                     onSliderDelete = { id -> state.removeSlider(id) },
                     // ---- 几何对象（#9）：度量/描点等结果也要在函数列表里看得见 ----
                     // 注意**不要**把 `complexResultPoints()` 也加进来：复平面下
@@ -832,11 +807,12 @@ fun GraphScreen(
                         metrics = metrics,
                         onSelectTool = { tool -> state.selectTool(tool) },
                         onClearObjects = {
-                            // 清屏：只清几何对象。给了撤销机会（底部浮出小条），
-                            // 理由和删函数一样 —— 一下全没了，必须留后路。
+                            // 清屏：只清几何对象。撤销走工具条上那对箭头
+                            // （`clearObjects` 已经在改动前压了一步），所以这里只报一句
+                            // "刚才发生了什么" —— 本轮起**不再**出现"点此撤销"那种字样。
                             if (state.objects.isNotEmpty()) {
                                 state.clearObjects()
-                                state.showToast("已清屏 · 可在列表底部撤销")
+                                state.showToast("已清屏")
                             } else {
                                 state.showToast("还没有用工具画过东西")
                             }
@@ -845,14 +821,15 @@ fun GraphScreen(
                             // 垃圾桶长按 = 连函数/方程一起清。
                             // 这一路接的是需求 #8 之前的"长按 + 清空全部函数"：
                             // 那个手势改成保存图像之后，清空能力搬到这里。
-                            // 撤销条本身有三路优先级（清函数 > 删函数 > 清对象/删对象），
-                            // 所以先撤销回函数、再点一次撤销回几何对象 —— 一次动作能全撤回。
+                            // 撤销：`clearObjects` + `clearAllFunctions` 各自在改动前
+                            // 压了一步，所以工具条上的左箭头**按两次**就能把它们都要回来
+                            // （一次撤"清空全部"、再一次撤"清屏"）。
                             if (state.functions.isEmpty() && state.objects.isEmpty()) {
                                 state.showToast("屏幕上已经什么都没有了")
                             } else {
                                 state.clearObjects()
                                 state.clearAllFunctions()
-                                state.showToast("已清掉全部内容 · 可在列表底部撤销")
+                                state.showToast("已清掉全部内容")
                             }
                         },
                         onBackToGraph = { state.backToGraph() },
@@ -864,6 +841,23 @@ fun GraphScreen(
                         },
                         // 左上角文件夹 → 「函数文件」列表（这一轮新增的入口）
                         onOpenSaves = { state.openSaves() },
+                        // ---- 工具条上那对箭头（本轮新增，和第一屏**逐项同构**）----
+                        // 第二屏的 🗑（清屏 / 长按清空全部）同样是"有意义的改动"，
+                        // 同样会被记进同一个历史栈，所以这里的两个回调与第一屏一字不差。
+                        canUndo = state.canUndo,
+                        canRedo = state.canRedo,
+                        onUndoStep = {
+                            val label = state.undo()
+                            state.showToast(
+                                if (label == null) "没有可撤销的操作" else "已撤销：$label"
+                            )
+                        },
+                        onRedoStep = {
+                            val label = state.redo()
+                            state.showToast(
+                                if (label == null) "没有可重做的操作" else "已重做：$label"
+                            )
+                        },
                         rotary = rotary
                     )
                 }
@@ -954,7 +948,11 @@ fun GraphScreen(
                     BackHandler { state.route = Route.List }
                     AboutScreen(
                         metrics = metrics,
-                        onBack = { state.route = Route.List }
+                        onBack = { state.route = Route.List },
+                        // 表冠：这一屏现在是**可滚动列表**（图标 + 七行装不下 233dp 的圆屏），
+                        // 接法和设置页 / 函数列表 / 文件列表一字不差；不接的话这一屏
+                        // 就只能用手指划（手表上手指划列表本来就别扭）。
+                        rotary = rotary
                     )
                 }
 
@@ -1215,7 +1213,12 @@ fun GraphScreen(
                             // 三个数值栏都是"立即生效"：取值在**编译期**折进表达式，
                             // 而 GraphScreen 顶部的采样 LaunchedEffect 以 sliders 为
                             // key，所以它会自己重算一遍 —— 同样不需要在这里调 replot。
-                            onChange = { state.updateSlider(it) },
+                            //
+                            // ⚠️ 本轮从 `updateSlider` 换成 `editSlider`（本轮新增）：
+                            // 前者是**没有撤销点**的那一个（拖滑轨、播放循环每帧都在调它，
+                            // 压撤销点会把 20 步历史在一秒内冲干净）；属性屏里改名字/上下界
+                            // 才算"有意义的一步"。tag 相同 ⇒ 同一个属性的连打字只算一步。
+                            onChange = { state.editSlider(it) },
                             onDone = { state.route = Route.List }
                         )
                     }
@@ -1392,24 +1395,22 @@ fun GraphScreen(
             // 用户上一轮报的"提示都在屏幕中间，非常影响操作"说的就是这一族浮层 ——
             // 两处共用一个锚点，"提示一律在屏幕底下"才是结构性的，而不是靠两处各写一遍。
             //
-            // ⚠️⚠️ **和撤销条的关系（本轮新增的那条要求）**：第一屏那条
-            // 「已删除 · 点此撤销」也在底部。两者可能同时出现（删掉一行之后两秒内
-            // 又弹了一条 toast），所以落点由 [toastBottomPad] 现算：
-            // **撤销条在时，toast 抬到它上方**（读的是 `FLOAT_PILL_*` 那两个共享常量，
-            // 见那个函数的推导）；撤销条不在时，就落在"热区 + 缩放栏"之上那一档。
-            // 这样两条胶囊永远不重叠，而且不需要它们互相知道对方的内部状态。
+            // ⚠️ **底部现在只剩 toast 一条胶囊了**：原来第一屏还有一条
+            // 「已删除 · 点此撤销」也在底部，于是落点要现算"谁在下面、谁让开"。
+            // 本轮用户要求把那些撤销提示全删掉，所以那个 `undoVisible` 参数
+            // 与那段"让开撤销条"的推导**一起删了**（见 [toastBottomPad]）。
             //
-            // ## 外形：**照搬撤销条**（用户本轮："toast 提示的样式统一成撤销删除的样式，
-            // 颜色用原来的颜色。现在圆角太大了不好看。"）
+            // ## 外形：**和撤销条同一种**（用户上一轮："toast 提示的样式统一成撤销删除的
+            // 样式，颜色用原来的颜色。现在圆角太大了不好看。"）
             //
             // 外形（形状/圆角/高度/内边距/字号/对齐）全部由 `Common.FloatPill` 提供 ——
-            // 和撤销条**同一个实现、同一批常量**，所以两者的圆角必然是同一档；
+            // 所以底部这一族胶囊在**整个 App 里只有一种长相**；
             // 底色仍然用 toast 自己的**强调色**（用户明确说颜色不要跟着变），
             // 只把"长得什么形状"统一过来。
             // 圆角"太大"的真因：原来这条胶囊是**内容撑高**的（`maxLines = 3` + 上下内边距），
             // 而 `PillShape` 是 `percent = 50`（半径 = 半个高度）—— 文字一长，胶囊一高，
-            // 半径就跟着变成"半个高度"那么大。现在改成**定高**（[FLOAT_PILL_H]，
-            // 和撤销条同一个数），半径永远等于半个行高，量出来的就是撤销条那一档。
+            // 半径就跟着变成"半个高度"那么大。现在改成**定高**（[FLOAT_PILL_H]），
+            // 半径永远等于半个行高，量出来的就是那一档。
             AnimatedVisibility(
                 visible = state.toast != null,
                 enter = fadeIn(animationSpec = tween(durationMillis = 180)) +
@@ -1422,9 +1423,7 @@ fun GraphScreen(
                     .padding(
                         bottom = toastBottomPad(
                             metrics = metrics,
-                            geometry = geometry,
-                            zoomBarVisible = settings.showZoomBar,
-                            undoVisible = undoVisible
+                            zoomBarVisible = settings.showZoomBar
                         )
                     )
                     // ---- 宽度：圆屏弧宽 / 非圆屏满宽（用户的长效规矩：按键与浮层都要自适应屏宽）----
@@ -2786,45 +2785,20 @@ private fun bottomPillPadFraction(zoomBarVisible: Boolean): Float =
     }
 
 /**
- * **toast 离屏幕底边多高**（dp）—— 两个约束取更靠上的那个。
+ * **toast 离屏幕底边多高**（dp）。
  *
- * 用户本轮的要求："移动后**别和撤销条叠在一起**（两者都可能出现在底部）"。
+ * 只有一个约束：**底部上滑热区 +（缩放栏开着时）缩放栏 + 一条缝**
+ * —— 见 [bottomPillPadFraction]。
  *
- * 约束 ①：底部上滑热区 +（缩放栏开着时）缩放栏 + 一条缝 —— 见 [bottomPillPadFraction]。
- * 约束 ②：**撤销条在时，抬到它上方**。撤销条那一条的几何是
- * （`FunctionList` 的撤销条 + `Common.FLOAT_PILL_*`，两处读**同一批常量**）：
- *
- * ```
- *   撤销条底边离屏幕底边 = geometry.sx(FLOAT_PILL_BOTTOM_PAD)   // 占屏宽 0.06
- *   撤销条高             = metrics.sizeDp × FLOAT_PILL_H          // 占短边 0.105
- *   ⇒ 撤销条顶边         = 上面两个之和
- *   ⇒ toast 底边 ≥ 撤销条顶边 + 一条缝
- * ```
- *
- * 为什么"占屏宽"那一项要用 `geometry.sx(...)` 而不是短边比例：撤销条自己就是用
- * `geometry.sx(FLOAT_PILL_BOTTOM_PAD)` 定位的（`FunctionList` 那一处），
- * 这里必须用**同一把尺子**，否则在"屏宽 ≠ 短边"的屏上算出来的顶边是错的 ——
- * 横屏尤其明显（短边是屏高，0.06 × 屏宽会比 0.06 × 短边大一倍多，那里正是两条胶囊会撞上的情形）。
- *
- * 为什么不是"永远给撤销条留位"：撤销条大部分时间不在（它是 2 秒的浮层），
- * 常驻地把它那一档留空只会让 toast 白白抬高一条 —— 只在它真的在时才让位。
- *
- * 实测（圆表 233dp）：撤销条占 y ∈ [194.5, 219]（从顶算），toast 占 [165.6, 190.1] →
- * 本来就差 4.5dp 不重叠；这一条算式的作用是**把它变成结构性的**（横屏那类比例下
- * 0.06 × 屏宽会涨到 51dp，不抬就会真的叠在一起）。
+ * ⚠️ 本轮删掉了原来那个"撤销条在时抬到它上方"的第二个约束（连 `geometry` 与
+ * `undoVisible` 两个参数一起）：用户要求把所有的撤销提示删掉，第一屏底部那条
+ * 「已删除 · 点此撤销」已经不存在了 —— 底部这一族胶囊现在**只剩 toast 一条**，
+ * 所以"两条会不会撞在一起"这件事本身没有了。
  */
 private fun toastBottomPad(
     metrics: WatchMetrics,
-    geometry: ScreenGeometry,
-    zoomBarVisible: Boolean,
-    undoVisible: Boolean
-): Dp {
-    val base = metrics.sizeDp * bottomPillPadFraction(zoomBarVisible)
-    if (!undoVisible) return base
-    val undoTop = geometry.sx(FLOAT_PILL_BOTTOM_PAD) + metrics.sizeDp * FLOAT_PILL_H
-    val above = undoTop + metrics.sizeDp * BOTTOM_PILL_GAP
-    return maxOf(base, above)
-}
+    zoomBarVisible: Boolean
+): Dp = metrics.sizeDp * bottomPillPadFraction(zoomBarVisible)
 
 
 // ---------------------------------------------------------------------------
@@ -2936,12 +2910,16 @@ private const val SAVE_BACKDROP_IN_MS = 180
 private const val SAVE_BACKDROP_OUT_MS = 140
 
 /**
- * 撤销条 / toast 的停留时长（毫秒）。
+ * 底部 toast 的停留时长（毫秒）。
  *
- * 用户要求：**都只留 2 秒**。原来是撤销条 4 秒、toast 3.6 秒 —— 手表上"信息早就看完了它还赖在屏幕上"，
- * 而这两个东西都浮在图像之上、会一直挡着内容。统一成一个常量，也免得以后两处再走散。
+ * 用户要求：**只留 2 秒**（原来是撤销条 4 秒、toast 3.6 秒）—— 手表上"信息早就看完了
+ * 它还赖在屏幕上"，而它浮在图像之上、会一直挡着内容。
+ *
+ * ⚠️ 本轮改名：原来叫 `UNDO_VISIBLE_MS`（"撤销条/toast 的停留时长"），
+ * 而撤销条本轮被用户要求整套删掉了 —— 这个数现在只决定 toast 的存活时间，
+ * 名字跟着改成 `TOAST_VISIBLE_MS`，"别让名字撒谎"。
  */
-private const val UNDO_VISIBLE_MS = 2000L
+private const val TOAST_VISIBLE_MS = 2000L
 private const val SWIPE_UP_THRESHOLD = 0.09f
 
 /**
