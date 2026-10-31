@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  圆形启动器图标的老系统回退版（API 24 / 25），和 [ic_launcher.xml] 同一份内容：
+  老系统上 `android:roundIcon` 要么不被平台使用（24），要么没有自适应图标可用（25），
+  所以这里也给一份普通图，免得圆形图标的位置是空的。
+  详细说明见 mipmap-anydpi/ic_launcher.xml 顶部那段注释。
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@color/ic_launcher_background" />
+    <item android:drawable="@drawable/ic_launcher_foreground" />
+</layer-list>

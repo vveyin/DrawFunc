@@ -1,0 +1,25 @@
+
+# 签名密钥与口令不进版本库（密钥单独放在私有仓库 DrawFunc-keys）
+keystore.properties
+*.jks
+*.keystore
+
+# 本机配置（SDK 路径因机器而异）
+local.properties
+
+# Gradle / 构建产物
+.gradle/
+.kotlin/
+build/
+app/build/
+*.apk
+
+# IDE
+.idea/
+*.iml
+
+# 日志 / 崩溃转储
+*.log
+hs_err_pid*
+*.hprof
+replay_pid*

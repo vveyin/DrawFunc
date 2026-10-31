@@ -1,0 +1,52 @@
+# 版本目录 —— 全部围绕「本机能离线拿到什么」来选，不要随手升版本。
+#
+# 关键约束（实测）：
+#   * AGP 8.5.2   ：缓存里 7.2.2 / 8.5.2 / 9.3.0 可用，9.x 要 Gradle 9（下不到）。
+#   * Kotlin 2.0.20：与其配套的 compose-compiler-gradle-plugin 2.0.20 已在缓存里，
+#                    所以用 Compose 的 Kotlin 2.0 新插件方式，不再写 composeOptions。
+#   * Compose BOM 2024.09.00：对应 ui 1.7.3，缓存里已有。
+#   * 刻意不用 material3：缓存里没有该构件，而 Maven Central 在这台机器上不可达。
+#     MD3 的外观由 ui/WatchColors.kt（角色色板）+ ui/theme/Theme.kt（圆角/字号）手工实现。
+#   * compileSdk 34：SDK 管理器无法联网，只能用已装的 android-34。
+
+[versions]
+agp = "8.5.2"
+kotlin = "2.0.20"
+coreKtx = "1.13.1"
+activityCompose = "1.9.2"
+lifecycle = "2.8.7"
+coroutines = "1.8.1"
+composeBom = "2024.09.00"
+junit = "4.13.2"
+# Dimezis BlurView（JitPack，只发布在那里）。2.0.6 是最后一个
+# 「RenderScript 2.x 实现」版本：Android 12 以下走 RenderScript 软路径，
+# 正好是 API 24~30 设备（含用户的 Android 11 手表）唯一能用的路。
+blurview = "version-2.0.6"
+
+[libraries]
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
+androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycle" }
+kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
+
+androidx-compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
+androidx-ui = { group = "androidx.compose.ui", name = "ui" }
+androidx-ui-graphics = { group = "androidx.compose.ui", name = "ui-graphics" }
+androidx-ui-tooling = { group = "androidx.compose.ui", name = "ui-tooling" }
+androidx-ui-tooling-preview = { group = "androidx.compose.ui", name = "ui-tooling-preview" }
+androidx-foundation = { group = "androidx.compose.foundation", name = "foundation" }
+# 转场/入场动画（AnimatedContent、fadeIn/scaleIn/scaleOut、animateColorAsState 等）。
+# 它本来也是 foundation 的传递依赖，显式写出来免得以后依赖树一变就找不到。
+androidx-animation = { group = "androidx.compose.animation", name = "animation" }
+# Compose Material 2（不是 material3）。MD3 的外观由 WatchColors.kt + Theme.kt 手工实现，
+# 因为本机缓存里没有 material3 构件、且 Maven Central 不可达。
+androidx-material = { group = "androidx.compose.material", name = "material" }
+androidx-material-icons-core = { group = "androidx.compose.material", name = "material-icons-core" }
+
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+blurview = { group = "com.github.Dimezis", name = "BlurView", version.ref = "blurview" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }

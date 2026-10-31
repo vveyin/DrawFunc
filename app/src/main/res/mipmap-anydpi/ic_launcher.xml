@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  启动器图标的**老系统回退版**（API 24 / 25 用这一份）。
+
+  minSdk 从 30 降到 24 之后才需要它：`mipmap-anydpi-v26/` 里那两份是
+  `<adaptive-icon>`（自适应图标），这个资源类型 **API 26 才有**。
+  在 7.0 / 7.1 上 `@mipmap/ic_launcher` 就没有任何匹配的配置了 ——
+  不会崩，但启动器取不到图标（显示空白或兜底图标）。
+
+  这一份没有任何版本限定符（`-anydpi`），所以：
+    * API 24/25 —— 只有它能匹配，用它；
+    * API 26+ —— `-v26` 那份限定符更具体，平台仍然优先选自适应图标。
+
+  内容就是把自适应图标的两层拼起来：背景色 + 前景矢量（正弦曲线）。
+  前景那张是 108dp 画布、内容画在中心 72dp 安全区里，直接当普通图标用会略小一圈，
+  这是矢量图标复用前景的固有代价 —— 换来的是不必再维护一套 PNG。
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@color/ic_launcher_background" />
+    <item android:drawable="@drawable/ic_launcher_foreground" />
+</layer-list>
